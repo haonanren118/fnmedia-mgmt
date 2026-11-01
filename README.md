@@ -16,8 +16,6 @@
    `NameError: name 'GUARD_NATIVE_GUID' is not defined` 被 `except` 吞掉、直接透传官方响应 —— 表现为**媒体库看不到任何虚拟库**。现已改为引用 `vlibs._GUARD_NATIVE_GUID`。
 2. **新增「📱海量短剧」独立媒体库**：短剧从"脏类排除名单"移出，作为第 5 个海量分类库（与电影/剧集/动漫/综艺并列，无限滚动）。搜索**不**特殊包含短剧。
 3. **移除打赏内容**：删除管理页「为爱发电」卡片、`/v/ext/donate-qr` 路由与随包收款码图片，删除 `DONATE.md`。
-4. **更名与品牌**：「fnMedia扩展管理」，独立应用标识、独立 systemd 服务（`fnmedia-mgmt.service`）、独立网关 socket。
-5. **更换应用图标**。
 
 ## 媒体库
 
