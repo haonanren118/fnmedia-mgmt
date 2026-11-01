@@ -42,8 +42,6 @@ CHECK_TTL = 30 * 60
 # 后台启动后首次检查延迟 + 周期间隔。
 BOOT_DELAY = 20
 PERIOD = 6 * 3600
-# 下载总时长上限（秒）。
-DOWNLOAD_TIMEOUT = 180
 
 _LOCK = threading.Lock()
 _STATE: dict = {
@@ -289,82 +287,131 @@ async def start_update() -> dict:
     return {"code": 0, "msg": "已开始下载并安装更新", "data": _view()}
 
 
-def _proxy_candidates() -> list[str | None]:
-    """更新下载的通道候选，按优先级：update_proxy、subscription_proxy、直连。
+# 国内直连 GitHub Release 附件（objects.githubusercontent.com）常年只有几十 KB/s，
+# 且经常在传输中途被掐断（RemoteProtocolError: Server disconnected）。
+# 这里内置换源前缀按优先级尝试；镜像只做“搬运”，包内容仍由 sha256 强制校验兜底——
+# 镜像若篡改内容，校验必然失败并拒绝安装，所以走镜像不降低安全性。
+MIRRORS = (
+    "https://ghfast.top/",
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+)
+# 单通道低速熔断：观察窗口内平均速度低于阈值就放弃，立刻换下一个通道。
+STALL_WINDOW = 6.0            # 秒
+STALL_MIN_BPS = 40 * 1024     # 40 KB/s
+CHANNEL_DEADLINE = 240        # 单通道最长耗时（秒）
+
+
+def _channels(url: str) -> list[tuple[str, str, str | None]]:
+    """下载通道候选 (标签, 实际地址, 代理)，按优先级：用户代理 → 内置镜像 → 直连。
 
     服务以干净 systemd 环境运行（无 *_proxy），国内直连 GitHub Release 附件
-    CDN 常握手超时，因此允许用户在管理页为“更新”单独配置代理。
+    CDN 常握手超时，因此允许用户在管理页为“更新”单独配置代理；未配置时
+    优先走内置镜像，直连只做最后兜底。
     """
-    cands: list[str | None] = []
+    out: list[tuple[str, str, str | None]] = []
+    proxies: list[str] = []
     if _config is not None:
         try:
             cfg = _config.config.get()
             for key in ("update_proxy", "subscription_proxy"):
                 v = (cfg.get(key) or "").strip()
-                if v and v not in cands:
-                    cands.append(v)
+                if v and v not in proxies:
+                    proxies.append(v)
         except Exception:  # noqa: BLE001
             pass
-    cands.append(None)  # 直连兜底
-    return cands
+    for p in proxies:
+        out.append((f"代理 {p}", url, p))
+    for m in MIRRORS:
+        out.append((f"镜像 {m.split('//', 1)[-1].rstrip('/')}", m + url, None))
+    out.append(("直连", url, None))
+    return out
+
+
+def _download_one(url: str, dest: Path, proxy: str | None, tag: str,
+                  total_hint: int = 0) -> None:
+    """单通道下载：支持断点续传（.part 保留已下字节），低速自动熔断。"""
+    part = dest.with_suffix(dest.suffix + ".part")
+    have = part.stat().st_size if part.exists() else 0
+    headers = {"User-Agent": "fnmedia-mgmt-updater"}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    kwargs = dict(
+        timeout=httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=10.0),
+        follow_redirects=True, trust_env=False, headers=headers)
+    if proxy:
+        kwargs["proxy"] = proxy
+
+    started = time.time()
+    with httpx.Client(**kwargs) as cli:
+        with cli.stream("GET", url) as resp:
+            if resp.status_code not in (200, 206):
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                have = 0  # 服务器不支持续传：丢弃旧 .part，从头写
+            total = int(resp.headers.get("content-length") or 0) + have
+            if not total:
+                total = int(total_hint or 0)
+            got = have
+            win_t0, win_bytes = started, have
+            with part.open("ab" if have else "wb") as f:
+                for chunk in resp.iter_bytes(1 << 20):
+                    f.write(chunk)
+                    got += len(chunk)
+                    now = time.time()
+                    if total:
+                        pct = min(100, got * 100 // total)
+                        speed = (got - win_bytes) / max(0.001, now - win_t0)
+                        with _LOCK:
+                            _STATE["progress"] = (
+                                f"下载中 {pct}%（{tag}，{speed / 1024:.0f}KB/s）")
+                    # 低速熔断：避免在一条烂通道上白等几分钟
+                    if now - win_t0 >= STALL_WINDOW:
+                        speed = (got - win_bytes) / (now - win_t0)
+                        if speed < STALL_MIN_BPS:
+                            raise RuntimeError(
+                                f"速度过低 {speed / 1024:.0f}KB/s，换下一个通道")
+                        win_t0, win_bytes = now, got
+                    if now - started > CHANNEL_DEADLINE:
+                        raise RuntimeError("通道超时")
+    if total and got != total:
+        raise RuntimeError(f"下载不完整 {got}/{total}")
+    part.replace(dest)
 
 
 def _download_with_fallbacks(url: str, dest: Path, total_hint: int = 0) -> None:
-    """依次尝试各代理通道流式下载到 dest；任一通道完整成功即返回。"""
-    last_err = ""
-    for i, proxy in enumerate(_proxy_candidates()):
-        tag = "代理" if proxy else "直连"
+    """依次尝试各通道流式下载到 dest；任一通道完整成功即返回。"""
+    errs: list[str] = []
+    for tag, real_url, proxy in _channels(url):
         try:
-            kwargs = dict(timeout=httpx.Timeout(DOWNLOAD_TIMEOUT, connect=15),
-                          follow_redirects=True, trust_env=False,
-                          headers={"User-Agent": "fnmedia-mgmt-updater"})
-            if proxy:
-                kwargs["proxy"] = proxy
-            with httpx.Client(**kwargs) as cli:
-                with cli.stream("GET", url) as resp:
-                    if resp.status_code != 200:
-                        raise RuntimeError(f"HTTP {resp.status_code}")
-                    total = int(resp.headers.get("content-length") or total_hint or 0)
-                    got = 0
-                    tmp = dest.with_suffix(dest.suffix + ".part")
-                    with tmp.open("wb") as f:
-                        for chunk in resp.iter_bytes(1 << 20):
-                            f.write(chunk)
-                            got += len(chunk)
-                            if total:
-                                pct = got * 100 // total
-                                with _LOCK:
-                                    _STATE["progress"] = f"下载中 {pct}%（{tag}）"
-                    # 大小校验（有 content-length 时）
-                    if total and got != total:
-                        raise RuntimeError(f"下载不完整 {got}/{total}")
-                    tmp.replace(dest)
+            _download_one(real_url, dest, proxy, tag, total_hint)
             return
         except Exception as exc:  # noqa: BLE001
-            last_err = f"{tag}：{type(exc).__name__} {str(exc)[:80]}"
-            try:
-                dest.with_suffix(dest.suffix + ".part").unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
-                pass
+            errs.append(f"{tag}：{type(exc).__name__} {str(exc)[:80]}")
             continue
-    raise RuntimeError("所有下载通道均失败：" + last_err)
+    # 全部失败：清掉残留分片，避免误导下一次尝试
+    try:
+        dest.with_suffix(dest.suffix + ".part").unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    raise RuntimeError("所有下载通道均失败：" + "；".join(errs[-3:]))
 
 
 def _get_text_with_fallbacks(url: str) -> str:
     last_err = ""
-    for proxy in _proxy_candidates():
+    for tag, real_url, proxy in _channels(url):
         try:
-            kwargs = dict(timeout=httpx.Timeout(30, connect=12),
+            kwargs = dict(timeout=httpx.Timeout(20, connect=8),
                           follow_redirects=True, trust_env=False,
                           headers={"User-Agent": "fnmedia-mgmt-updater"})
             if proxy:
                 kwargs["proxy"] = proxy
             with httpx.Client(**kwargs) as cli:
-                r = cli.get(url)
+                r = cli.get(real_url)
                 r.raise_for_status()
                 return r.text
         except Exception as exc:  # noqa: BLE001
-            last_err = str(exc)
+            last_err = f"{tag}：{type(exc).__name__} {str(exc)[:60]}"
             continue
     raise RuntimeError("下载校验文件失败：" + last_err)
 
