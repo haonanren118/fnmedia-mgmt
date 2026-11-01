@@ -490,6 +490,18 @@ fi
 # 仅清理字节码缓存（不碰任何数据文件）
 find "$ROOT/proxy" -name '__pycache__' -type d -prune -exec rm -rf {{}} + 2>/dev/null || true
 echo "[upd] code replaced; installed VERSION=$(cat "$ROOT/VERSION" 2>/dev/null)"
+# 同步应用中心元数据：飞牛应用中心显示的是 /var/apps/<app>/manifest 里的 version，
+# 而热更新只覆盖 /vol1/@appcenter/<app>/repo 的代码目录，不动这个文件。
+# 不同步的结果就是「代码已是新版、应用中心仍显示首次安装的版本号」（实际踩到过）。
+APPMAN=/var/apps/fnmedia-mgmt/manifest
+if [ -f "$EXTRACT/manifest" ] && [ -d /var/apps/fnmedia-mgmt ]; then
+  cp -f "$APPMAN" "$APPMAN.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  if cp -f "$EXTRACT/manifest" "$APPMAN" 2>/dev/null; then
+    echo "[upd] appcenter manifest synced: $(grep '^version' "$APPMAN" | tr -d ' ')"
+  else
+    echo "[upd] WARN cannot sync appcenter manifest"
+  fi
+fi
 # 渲染 systemd 单元并重启（install.sh 内部会 daemon-reload/enable/restart）
 bash "$ROOT/deploy/install.sh" || fail "install.sh 启动失败"
 sleep 3
