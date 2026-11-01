@@ -609,7 +609,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       <div class="card">
         <div class="card-title">播放线路</div>
         <label class="switch-row"><input type="checkbox" id="lineFastest"/>
-          <span>自动选最快线路<span class="sub">起播时并行测速、自动选首字节最快的线路；同一集短时间内固定用它</span></span></label>
+          <span>自动选最快线路<span class="sub">起播时并行<b>实测下载速度</b>（各拉一小段分片），选真正最快的线路，不是只看响应快；同一集短时间内固定用它。播放器里手动切的线路始终按你选的走，不会被自动覆盖</span></span></label>
         <label class="field" style="max-width:260px"><span>参与测速的线路数</span>
           <input type="number" id="fastestMax" min="2" max="12" style="width:100%"/></label>
         <label class="field" style="max-width:260px"><span>测速超时（秒）</span>

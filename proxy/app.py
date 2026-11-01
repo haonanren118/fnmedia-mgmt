@@ -17,6 +17,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -2877,6 +2878,11 @@ _LINE_BAD: dict[str, float] = {}
 _PROBE_TIMEOUT = 8.0
 _PROBE_MAX_CANDIDATES = 8     # 最多探测候选线路数（控制起播开销）
 _PROBE_RANGE = "bytes=0-2047"
+# 起播竞速的测速窗口：光测首字节不够 —— “响应快但只有 100KB/s”的线首字节能赢，
+# 起播两三秒后缓冲吃完就卡。竞速时额外读一段分片实测吞吐（到量或到时就停，
+# 保证起播总耗时可控：最多多花 _PROBE_SPEED_SECS 一秒多）。
+_PROBE_SPEED_BYTES = 384 * 1024
+_PROBE_SPEED_SECS = 1.2
 
 
 def _line_bad_key(picked: dict) -> str:
@@ -2957,13 +2963,83 @@ def _ordered_candidates(picked: dict) -> list[dict]:
     return cands
 
 
-async def _probe_latency(cand: dict, request: Request,
-                         build_hls: bool = False) -> float | None:
-    """探测一条线路该集是否可播，并返回“起播延迟”（秒，越小越快）。
+async def _read_stream_once(cli: httpx.AsyncClient, url: str, headers: dict,
+                            budget_bytes: int, budget_secs: float
+                            ) -> tuple[bool, int, bytes]:
+    """Range 读一小段，到量或到时即停。返回 (是否可播, 字节数, 首块字节)。"""
+    got = 0
+    t0 = time.time()
+    ok = False
+    head = b""
+    try:
+        async with cli.stream("GET", url, follow_redirects=True,
+                              headers={**headers,
+                                       "Range": f"bytes=0-{budget_bytes - 1}"}) as r:
+            if r.status_code >= 400:
+                return (False, 0, b"")
+            ok = True
+            async for chunk in r.aiter_bytes(65536):
+                if not chunk:
+                    continue
+                if not head:
+                    head = chunk
+                got += len(chunk)
+                if got >= budget_bytes or time.time() - t0 >= budget_secs:
+                    break
+    except asyncio.TimeoutError:
+        pass                      # 用已读字节计速（ok 判定照旧）
+    except Exception:             # noqa: BLE001
+        if got <= 0:
+            return (False, 0, b"")
+    return (ok, got, head)
+
+
+async def _probe_seg_speed(cli: httpx.AsyncClient, urls: list[str],
+                           headers: dict, budget_bytes: int, budget_secs: float
+                           ) -> tuple[bool, int, float, bytes]:
+    """跨若干分片累计实测吞吐，返回 (是否可播, 字节数, 字节/秒, 首块字节)。
+
+    只看首分片不够：有些线路首片只有两三 KB（正文在后面几片），样本太小测出来的
+    “速度”纯属 TCP 突发。这里在同一个时间窗内跨片累计（最多 12 片）；若样本仍然
+    很少、时间窗也没走完、片又没取到头，就判为“测不出”（速度 0），让选线退回按
+    起播延迟排 —— 绝不拿噪声当依据。"""
+    MAX_SEGS = 12
+    t0 = time.time()
+    got = 0
+    head = b""
+    ok = False
+    tried = 0
+    for i, u in enumerate(urls[:MAX_SEGS]):
+        remain_t = budget_secs - (time.time() - t0)
+        remain_b = budget_bytes - got
+        if remain_t <= 0.05 or remain_b <= 0:
+            break
+        tried += 1
+        s_ok, g, h = await _read_stream_once(cli, u, headers, remain_b, remain_t)
+        if i == 0:
+            ok, head = s_ok, h
+            if not s_ok:
+                return (False, 0, 0.0, b"")
+        elif not s_ok:
+            break                 # 后续片失败不影响已读样本
+        got += g
+    elapsed = max(time.time() - t0, 0.05)
+    # 小分片源（每片几 KB）必须靠“取满 12 片”才够样本，够本就采信
+    enough = got >= 32768 or elapsed >= budget_secs * 0.6 or tried >= MAX_SEGS
+    bps = got / elapsed if enough else 0.0
+    return (ok, got, bps, head)
+
+
+async def _probe_latency_ex(cand: dict, request: Request,
+                            build_hls: bool = False,
+                            measure: bool = False
+                            ) -> tuple[float, float] | None:
+    """探测一条线路该集是否可播，返回 (起播延迟秒, 实测字节/秒)；不可播返回 None。
 
     会就地解析（专有源/跳转/分享，与真实播放同一套逻辑）。失败/文件不存在返回 None。
     build_hls=True 时，HLS 线路顺手构建改写后的播放列表并填缓存（main 取流零额外抓取）；
-    竞速阶段传 False，只做轻量验活（抓原始清单，不改写），选出胜者后再构建。"""
+    竞速阶段传 False，只做轻量验活（抓原始清单，不改写），选出胜者后再构建。
+    measure=True 时额外实测下载速度（竞速用）；纯延迟探测传 False，第二项恒为 0.0。"""
     t0 = time.time()
     try:
         await _resolve_if_needed(cand, request)
@@ -3006,7 +3082,12 @@ async def _probe_latency(cand: dict, request: Request,
             # 小雅/AList 对“目录或不存在文件”回 200 + JSON 错误（假活），判死
             if "json" in ctype or body[:1] in (b"{", b"["):
                 return None
-            return time.time() - t0
+            lat = time.time() - t0
+            if measure:
+                s_ok, _got, bps, _hd = await _probe_seg_speed(
+                    cli, [url], headers, _PROBE_SPEED_BYTES, _PROBE_SPEED_SECS)
+                return (lat, bps if s_ok else 0.0)
+            return (lat, 0.0)
 
         # HLS
         key = _playlist_cache_key(cand)
@@ -3017,7 +3098,7 @@ async def _probe_latency(cand: dict, request: Request,
                     not await _verify_rewritten_first_seg(body, request, cand):
                 _PLAYLIST_CACHE.pop(key, None)
                 return None
-            return time.time() - t0
+            return (time.time() - t0, 0.0)
         if build_hls:
             mg = getattr(request.state, "_play_mg", "") if hasattr(request, "state") else ""
             if mg:
@@ -3028,7 +3109,7 @@ async def _probe_latency(cand: dict, request: Request,
                         not await _verify_rewritten_first_seg(body, request, cand):
                     _PLAYLIST_CACHE.pop(key, None)
                     return None
-                return time.time() - t0
+                return (time.time() - t0, 0.0)
         # 轻量验活：抓原始清单（跟随嵌套 master），不做分片改写
         text, _cur = await _fetch_playlist(request, url, headers)
         if text is None or not _is_media_playlist(text):
@@ -3037,11 +3118,26 @@ async def _probe_latency(cand: dict, request: Request,
         # 但所有分片在源站 404（清单活、分片死）。只验清单会误判可播，起播即报错。
         # 取首个分片 Range 2KB 复核：4xx/5xx 或空体即判死，触发自动换线。
         try:
-            first_seg = next(
-                (ln.strip() for ln in text.splitlines()
-                 if ln.strip() and not ln.lstrip().startswith("#")), "")
-            if first_seg:
-                seg_url = urllib.parse.urljoin(_cur, first_seg)
+            seg_list = [urllib.parse.urljoin(_cur, ln.strip())
+                        for ln in text.splitlines()
+                        if ln.strip() and not ln.lstrip().startswith("#")]
+            seg_url = ""
+            if seg_list:
+                seg_url = seg_list[0]
+                if measure:
+                    # 竞速：验活 + 实测速度一起做，按时间窗跨片累计（首片常只有几 KB）
+                    ok, got, bps, head = await _probe_seg_speed(
+                        cli, seg_list, headers, _PROBE_SPEED_BYTES,
+                        _PROBE_SPEED_SECS)
+                    if not ok:
+                        _log.info("线路首分片判死: %s 《%s》%s",
+                                  cand.get("line"), cand.get("title"),
+                                  urllib.parse.urlsplit(seg_url).netloc)
+                        return None
+                    # 源站对失效分片常回 200 + XML/HTML 错误页（非媒体）
+                    if got <= 0 or head[:1] in (b"<", b"{", b"["):
+                        return None
+                    return (time.time() - t0, bps)
                 sreq = cli.build_request(
                     "GET", seg_url, headers={**headers, "Range": _PROBE_RANGE})
                 sr = await cli.send(sreq, follow_redirects=True)
@@ -3067,9 +3163,16 @@ async def _probe_latency(cand: dict, request: Request,
                         pass
         except Exception:
             return None
-        return time.time() - t0
+        return (time.time() - t0, 0.0)
     except Exception:
         return None
+
+
+async def _probe_latency(cand: dict, request: Request,
+                         build_hls: bool = False) -> float | None:
+    """兼容壳：只要起播延迟（故障切换/健康度统计用），不测速也不带速度项。"""
+    got = await _probe_latency_ex(cand, request, build_hls)
+    return got[0] if got else None
 
 
 async def _probe_target(cand: dict, request: Request) -> bool:
@@ -3357,8 +3460,10 @@ def _race_candidates(picked: dict) -> list[dict]:
 
 
 async def _race_fastest(picked: dict, request: Request) -> dict | None:
-    """并行竞速探测候选线路，选首字节延迟最低者（默认高质量线给小幅领先优势）。
+    """并行竞速探测候选线路，选**实测下载最快**者（速度接近时再比起播延迟）。
 
+    只比首字节会把“响应快但只有百来 KB/s”的线选成最优，播几秒就卡；这里每条线
+    都真拉一小段分片测吞吐（≤384KB / ≤1.2s 窗口），按吞吐分档排。
     返回胜出的已解析目标（HLS 胜者会再构建播放列表缓存）；全部失败返回 None。"""
     cands = _race_candidates(picked)
     if not cands:
@@ -3369,40 +3474,51 @@ async def _race_fastest(picked: dict, request: Request) -> dict | None:
         prefer = float(config.get().get("line_fastest_prefer", 0.25))
     except Exception:
         timeout, prefer = 4.0, 0.25
+    # 测速窗口本身要占 1.2s，给足余量，避免把“慢但可播”的线误判成失败而标坏
+    timeout = max(timeout, _PROBE_SPEED_SECS + 2.0)
     sem = asyncio.Semaphore(_RACE_CONCURRENCY)
 
     async def run(cand: dict):
         async with sem:
-            lat = await asyncio.wait_for(
-                _probe_latency(cand, request, build_hls=False),
+            got = await asyncio.wait_for(
+                _probe_latency_ex(cand, request, build_hls=False, measure=True),
                 timeout=timeout)
-        return cand, lat
+        return cand, got
 
     results = await asyncio.gather(*[run(c) for c in cands],
                                    return_exceptions=True)
-    ok = [(c, lat) for r in results
-          if isinstance(r, tuple) for (c, lat) in [r] if lat is not None]
-    for c, _ in ok:
+    ok = [(c, lat, bps) for r in results
+          if isinstance(r, tuple) and len(r) == 2 and r[1] is not None
+          for (c, (lat, bps)) in [r]]
+    for c, _lat, _bps in ok:
         _LINE_BAD.pop(_line_bad_key(c), None)  # 探活成功，清掉可能的旧坏线标记
     if not ok:
         for c in cands:
             _mark_line_bad(c)
         return None
 
-    def eff(item):
-        c, lat = item
-        return lat - (prefer if default and c["line"] == default else 0.0)
+    def speed_bucket(bps: float) -> int:
+        """按 1.25 倍分档：速度差不到 25% 视为同档，别让测量噪声决定选哪条线。"""
+        if bps <= 1.0:
+            return 0
+        return int(round(math.log(bps) / math.log(1.25)))
 
-    winner, wlat = min(ok, key=eff)
+    def rank(item) -> tuple:
+        c, lat, bps = item
+        bonus = prefer if (default and c["line"] == default) else 0.0
+        # ①吞吐分档 ②同档内起播延迟（默认高质量线给小幅领先）③原始吞吐
+        return (speed_bucket(bps), -(lat - bonus), bps)
+
+    winner, wlat, wbps = max(ok, key=rank)
     _remember_fast(picked, winner["line"])
     # 胜者若是 HLS，构建改写后的播放列表供 main 直接取用
     if re.search(r"\.m3u8(\?|$)", winner.get("url", "").split("?", 1)[0], re.I):
         mg = getattr(request.state, "_play_mg", "") if hasattr(request, "state") else ""
         if mg:
             await _get_playlist_cached(mg, winner, request)
-    _log.info("线路竞速: 《%s》%s 选中 %s (%.2fs, %d 候选)",
+    _log.info("线路竞速: 《%s》%s 选中 %s (起播 %.2fs, 速度 %.0fKB/s, %d 候选)",
               picked.get("title"), picked.get("ep_title") or "",
-              winner.get("line"), wlat, len(ok))
+              winner.get("line"), wlat, wbps / 1024.0, len(ok))
     return winner
 
 
@@ -4106,6 +4222,9 @@ async def hls_main(mg: str, request: Request):
     request.state._play_mg = mg  # 供探测复用播放列表构建、填充缓存
     # 起播即跳过已知坏线（用户显式选线除外），避免无谓探测延迟
     picked = _dodge_known_bad(picked, request)
+    if explicit_line and picked.get("line"):
+        # 手动换源是用户的决定：同一集在 TTL 内自动起播也不再抢回自动选的那条
+        _remember_fast(picked, picked["line"])
     if _autofail_on():
         picked = await _ensure_playable(picked, request, auto=auto_play)
         # 若自动换到了别的线路，后续 _pick_episode 仍按 query 的旧线解析；用换好的目标
