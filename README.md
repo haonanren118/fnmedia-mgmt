@@ -2,7 +2,7 @@
 
 飞牛影视（trim.media）在线资源扩展的**管理端**。零侵入、可逆地接管官方影视入口，在原生搜索与媒体库中注入在线影视，并用飞牛自带播放器直接播放。
 
-- **版本**：0.0.3
+- **版本**：0.0.4
 - **作者**：haonanren118
 - **应用标识**：`fnmedia-mgmt`
 
@@ -36,7 +36,7 @@
 命令行安装（需 root）：
 
 ```bash
-sudo appcenter-cli install-fpk fnmedia-mgmt-0.0.3.fpk -v 1 -e ./env.txt
+sudo appcenter-cli install-fpk fnmedia-mgmt-0.0.4.fpk -v 1 -e ./env.txt
 # env.txt 内容：wizard_agree_terms=agree
 ```
 

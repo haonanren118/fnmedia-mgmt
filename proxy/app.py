@@ -23,6 +23,7 @@ import threading
 import time
 import urllib.parse
 import zlib
+from collections import OrderedDict
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -439,7 +440,12 @@ async def lifespan(app: FastAPI):
         transport=httpx.AsyncHTTPTransport(uds=UPSTREAM_SOCK),
         timeout=httpx.Timeout(120), trust_env=False)
     app.state.ext = httpx.AsyncClient(
-        timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True)
+        timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True,
+        # 播放分片是密集短请求：连接复用能省掉每次对 CDN 的 TCP+TLS 握手
+        # （实测握手 100~300ms，占单个分片耗时的可观比例）。默认池只有 20 条
+        # keep-alive，多设备并发播放时会被挤爆退化成反复重连。
+        limits=httpx.Limits(max_connections=64, max_keepalive_connections=32,
+                            keepalive_expiry=60.0))
     app.state.stop_hot = asyncio.Event()
     app.state.hot_task = asyncio.create_task(_hot_worker(app))
 
@@ -3481,6 +3487,207 @@ _PLAYLIST_TTL = 120.0
 # 单飞：同一「集+线路」只允许一次在途抓取，预热与真正取 main 共用同一个 Future
 _PLAYLIST_FUT: dict[str, asyncio.Future] = {}
 
+# ---------------------------------------------------------------- 分片预取
+# 为什么需要：国内源站链路普遍只有 90~250KB/s，单个 TS 分片（100~600KB）要
+# 1~5 秒才能下完。播放器按 HLS 语义是「要一片、等一片」，这段时间就是画面
+# 卡住的直接原因（实测同一部片的分片请求间隔 6~15 秒，而分片本身只有 4~5 秒）。
+# 做法：一片交付完，立刻在后台把**下一片**预先下载进内存，播放器真正来要时
+# 直接命中（0ms）。等效于把「下载」和「播放」并行起来，用播放的时间掩盖下载
+# 时间，且不改变任何客户端行为（清单/分片地址完全不变）。
+# 只预取 1 片：源站带宽本就紧张，预取过多会与当前片抢带宽，反而更卡。
+_SEG_CACHE: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
+_SEG_CACHE_BYTES = 0
+_SEG_CACHE_MAX_BYTES = 40 << 20   # 内存上限 40MB（约 100 片），够播放器抖动，不撑爆机器
+_SEG_CACHE_MAX_ITEMS = 120
+_SEG_PREFETCH: dict[str, asyncio.Task] = {}
+_SEG_PREFETCH_MAX = 6             # 同时在途的预取任务上限（多设备并发播放时兜底）
+
+
+def _seg_cache_get(url: str) -> "tuple[bytes, str] | None":
+    item = _SEG_CACHE.get(url)
+    if item is None:
+        return None
+    _SEG_CACHE.move_to_end(url)
+    return item
+
+
+def _seg_cache_put(url: str, body: bytes, ctype: str) -> None:
+    global _SEG_CACHE_BYTES
+    if not body:
+        return
+    old = _SEG_CACHE.pop(url, None)
+    if old is not None:
+        _SEG_CACHE_BYTES -= len(old[0])
+    _SEG_CACHE[url] = (body, ctype)
+    _SEG_CACHE_BYTES += len(body)
+    while _SEG_CACHE and (len(_SEG_CACHE) > _SEG_CACHE_MAX_ITEMS
+                          or _SEG_CACHE_BYTES > _SEG_CACHE_MAX_BYTES):
+        _k, _v = _SEG_CACHE.popitem(last=False)
+        _SEG_CACHE_BYTES -= len(_v[0])
+
+
+def _seg_cache_clear() -> None:
+    global _SEG_CACHE_BYTES
+    _SEG_CACHE.clear()
+    _SEG_CACHE_BYTES = 0
+
+
+# 分片顺序索引：上游分片地址 -> 紧接着的下一片地址。构建于每次成功抓到清单时。
+# 有了它，分片请求里查「下一片」是 O(1)，且不依赖本次请求解析出的 line 是否
+# 与当初抓清单时一致（自动换线场景下两者常不同，按 picked 反查会永远失配）。
+_SEG_NEXT: "OrderedDict[str, str]" = OrderedDict()
+_SEG_NEXT_MAX = 8000        # 约 3~4 部影片的分片数，超出淘汰最旧的
+
+
+def _query_u(line: str) -> str:
+    """从改写后的清单行里原样取出上游地址的 base64 参数。
+
+    不用 parse_qs：它会把 '+' 当成空格、把值里的 '=' 当分隔符，base64 一旦含这些
+    字符解出的地址就错位（错地址会让预取去下根本不属于本片的内容）。
+    """
+    try:
+        s = line if "?" in line else _self_url(line)
+        q = s.split("?", 1)[1] if "?" in s else ""
+        for part in q.split("&"):
+            if part.startswith("u="):
+                return urllib.parse.unquote(part[2:])
+    except Exception:
+        pass
+    return ""
+
+
+def _index_playlist_segments(body: str) -> None:
+    """从改写后的清单建立「当前片 -> 下一片」映射，供预取使用。"""
+    try:
+        raws: list[str] = []
+        for ln in body.splitlines():
+            ln = ln.strip()
+            if not ln or ln.lstrip().startswith("#"):
+                continue
+            u = _query_u(ln)
+            if not u:
+                continue
+            try:
+                raws.append(b64d(u))
+            except Exception:
+                continue
+        if len(raws) < 2:
+            return
+        for a, b in zip(raws, raws[1:]):
+            _SEG_NEXT[a] = b
+            _SEG_NEXT.move_to_end(a)
+        while len(_SEG_NEXT) > _SEG_NEXT_MAX:
+            _SEG_NEXT.popitem(last=False)
+    except Exception:
+        pass
+
+
+def _following_seg_urls(picked: dict, real_url: str, limit: int = 1) -> list[str]:
+    """取「当前分片之后」的上游地址，用于预取。
+
+    优先用清单顺序索引（O(1)、与线路无关）；没有索引时才退回按清单文本匹配。
+    匹配不到就放弃预取——宁可慢一点，也不能预取错分片让播放器放错画面。
+    """
+    out: list[str] = []
+    u = _SEG_NEXT.get(real_url)
+    while u and len(out) < limit:
+        out.append(u)
+        u = _SEG_NEXT.get(u)
+    if out:
+        return out
+    try:
+        hit = _PLAYLIST_CACHE.get(_playlist_cache_key(picked))
+        if not hit:
+            return []
+        raws: list[str] = []
+        for ln in hit[1].splitlines():
+            ln = ln.strip()
+            if not ln or ln.lstrip().startswith("#"):
+                continue
+            _u = _query_u(ln)
+            if not _u:
+                continue
+            try:
+                raws.append(b64d(_u))
+            except Exception:
+                continue
+        i = raws.index(real_url)
+        return raws[i + 1:i + 1 + limit]
+    except Exception:
+        return []
+
+
+async def _prefetch_one(cli, url: str, headers: dict, depth: int = 1,
+                        reg: "tuple[str, int] | None" = None) -> None:
+    """后台抓一个分片进缓存。任何失败都静默——预取只影响速度，绝不影响播放。
+
+    depth>1 时在本片落缓存后串行接着预取下一片（链条式，不并发抢带宽），
+    相当于把「提前量」拉长到两个分片周期，遇上特别大的分片也有余量。
+    reg=(注册表ID, 序号)：紧凑分片（hls?r=&i=）的真实地址只在服务端注册表里，
+    索引不到，必须按序号 +1 取下一片。
+    """
+    if url in _SEG_PREFETCH:
+        return
+    _SEG_PREFETCH[url] = asyncio.current_task()  # type: ignore[assignment]
+    try:
+        h = dict(headers or {})
+        h.setdefault("User-Agent", "Mozilla/5.0")
+        r = await cli.get(url, headers=h,
+                          timeout=httpx.Timeout(45.0, connect=8.0))
+        if r.status_code == 200 and r.content:
+            _seg_cache_put(url, r.content,
+                           r.headers.get("content-type") or "video/mp2t")
+            if depth > 1:
+                nxt, nreg = _SEG_NEXT.get(url), None
+                if not nxt and reg is not None:
+                    nxt = _hls_reg_get(reg[0], reg[1] + 1)
+                    nreg = (reg[0], reg[1] + 1)
+                if nxt and nxt not in _SEG_CACHE and nxt not in _SEG_PREFETCH:
+                    asyncio.create_task(
+                        _prefetch_one(cli, nxt, headers, depth - 1, nreg))
+        else:
+            _log.debug("prefetch bad %s %s", r.status_code, url[-26:])
+    except Exception as exc:
+        _log.debug("prefetch err %s %s", type(exc).__name__, url[-26:])
+    finally:
+        _SEG_PREFETCH.pop(url, None)
+
+
+def _start_prefetch(cli, url: str, headers: dict,
+                    reg: "tuple[str, int] | None" = None, depth: int = 2) -> None:
+    """按已知地址直接预取（紧凑分片路径用）。"""
+    if not url or url in _SEG_CACHE or url in _SEG_PREFETCH:
+        return
+    if len(_SEG_PREFETCH) >= _SEG_PREFETCH_MAX:
+        return
+    asyncio.create_task(_prefetch_one(cli, url, headers, depth, reg))
+
+
+def _start_seg_prefetch(cli, picked: dict, real_url: str,
+                        headers: dict, limit: int = 1, depth: int = 2) -> None:
+    """单片交付后启动后续分片的后台预取（单飞 + 有界）。"""
+    if len(_SEG_PREFETCH) >= _SEG_PREFETCH_MAX:
+        return
+    _nx = _following_seg_urls(picked, real_url, limit)
+    for u in _nx:
+        _start_prefetch(cli, u, headers, None, depth)
+
+
+async def _await_seg_prefetch(url: str, wait: float = 15.0) -> "tuple[bytes, str] | None":
+    """若该分片正被后台预取，等它落地后直接取缓存，绝不并发送两份请求。
+
+    这是关键一步：预取在途时若播放器又来要同一片，老实现会再发一次 GET，
+    两条连接在同一段带宽上互相拖慢，反而把这一片拖到十几秒（实测 9.8s）。
+    """
+    task = _SEG_PREFETCH.get(url)
+    if task is None:
+        return None
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=wait)
+    except Exception:
+        pass
+    return _seg_cache_get(url)
+
 # 紧凑分片注册表：夸克/UC 转码 HLS 的签名分片 URL 极长（~600 字符，base64 后近千），
 # 一部 90 分钟的片子上千分片会撑出 1MB+ 的清单，且每个分片 URL 超长，经外网网关
 # （Lucky/nginx/fngateway）容易被长度/缓冲限制拦掉，播放器拿到清单却拉不到分片。
@@ -3672,6 +3879,8 @@ async def _get_playlist_cached(mg: str, picked: dict, request: Request):
                 body, _base = await _build_playlist_body(mg, picked, request)
                 if body is not None and body is not _NOT_HLS:
                     _PLAYLIST_CACHE[key] = (time.time(), body)
+                    # 建立「当前片→下一片」索引，供分片预取使用
+                    _index_playlist_segments(body)
                     if len(_PLAYLIST_CACHE) > 600:
                         for k in list(_PLAYLIST_CACHE)[:300]:
                             _PLAYLIST_CACHE.pop(k, None)
@@ -3982,23 +4191,41 @@ async def hls_seg(mg: str, request: Request):
     headers = picked["headers"] if picked else {}
     # 透传 Range（播放器 seek）
     fwd = dict(headers)
+    is_dec = request.query_params.get("dec") == "1"
     # 加密 HLS 由本服务解密：不能按密文转发任意字节 Range，需完整拉取后回传纯 TS。
-    if request.query_params.get("dec") == "1":
+    if is_dec:
         fwd.pop("Range", None)
-    if "range" in request.headers and request.query_params.get("dec") != "1":
-        fwd["Range"] = request.headers["range"]
-    try:
-        # 分片在播放中途持续拉取，对瞬时抖动必须重试，否则单次失败播放器直接报错
-        r = await ext_get_retry(request, src_url, fwd, tries=4, timeout=30.0)
-    except Exception as exc:
-        _log.warning("seg fetch fail %s %s", type(exc).__name__,
-                     urllib.parse.urlsplit(src_url).netloc)
-        return Response(f"seg fail {type(exc).__name__}", status_code=502)
-    body = r.content
+    client_range = request.headers.get("range")
+    if client_range and not is_dec:
+        fwd["Range"] = client_range
+
+    # 预取命中：上一片交付时已在后台把这一片下好了，直接复用，省掉整段网络等待。
+    # 注意缓存里存的是**上游原始字节**（可能是密文、可能带 PNG 伪装外壳），
+    # 下面的解密/解壳流程照常执行 —— 这样加密源也能享受预取，且不会解错。
+    up = None
+    body = None
+    ctype = ""
+    if not client_range:
+        _hit = _seg_cache_get(src_url)
+        if _hit is None:
+            # 这一片正在后台预取：等它落地复用同一份下载，不另起一条连接
+            _hit = await _await_seg_prefetch(src_url)
+        if _hit is not None:
+            body, ctype = _hit[0], _hit[1]
+    if body is None:
+        try:
+            # 分片在播放中途持续拉取，对瞬时抖动必须重试，否则单次失败播放器直接报错
+            up = await ext_get_retry(request, src_url, fwd, tries=4, timeout=30.0)
+        except Exception as exc:
+            _log.warning("seg fetch fail %s %s", type(exc).__name__,
+                         urllib.parse.urlsplit(src_url).netloc)
+            return Response(f"seg fail {type(exc).__name__}", status_code=502)
+        body = up.content
+        ctype = up.headers.get("content-type", "")
     # 服务端解密 AES-128 HLS 分片：m3u8 已移除 EXT-X-KEY，这里把密文 TS 解成纯 TS，
     # 并强制按完整 200 内容返回（密文 206 不能直接解密/拼接）。
-    decrypt_resp_status = r.status_code
-    if request.query_params.get("dec") == "1":
+    decrypt_resp_status = up.status_code if up is not None else 200
+    if is_dec:
         try:
             import quality as _quality
             key = bytes.fromhex(b64d(request.query_params.get("k", "")))
@@ -4011,7 +4238,6 @@ async def hls_seg(mg: str, request: Request):
                     decrypt_resp_status = 200
         except Exception as exc:
             _log.warning("seg decrypt fail: %s", type(exc).__name__)
-    ctype = r.headers.get("content-type", "")
     unwrapped = False
     # 部分源把真实 TS 分片伪装成「1×1 PNG 头 + TS」。剥掉 PNG 外壳
     # 还原成纯 TS，飞牛播放器才能正常解码（通用兼容，对所有源生效）
@@ -4026,20 +4252,29 @@ async def hls_seg(mg: str, request: Request):
         except Exception:
             pass
     drop = {"content-security-policy"}
-    if request.query_params.get("dec") == "1":
+    if is_dec:
         # 已在服务端解密并返回完整纯 TS：旧的 Range/content-range 必须移除，
         # 否则严格客户端会因 200 + Content-Range/Accept-Ranges 语义矛盾拒绝该分片。
         drop.update({"content-range", "accept-ranges"})
     if unwrapped:
         drop.add("content-type")
-    h = _safe_response_headers(r.headers, drop)
+    h = _safe_response_headers(up.headers, drop) if up is not None else {}
     h["Access-Control-Allow-Origin"] = "*"
     h["Content-Length"] = str(len(body))
+    h.setdefault("Cache-Control", "max-age=2592000")
     if unwrapped or "content-type" not in {k.lower() for k in h}:
         h["Content-Type"] = ctype or "video/mp2t"
-    if r.status_code in _RETRY_STATUS:
-        _log.warning("seg upstream %s %s", r.status_code,
+    if up is not None and up.status_code in _RETRY_STATUS:
+        _log.warning("seg upstream %s %s", up.status_code,
                      urllib.parse.urlsplit(src_url).netloc)
+    # 交付后立刻把下一片预取进内存：播放器解码这一片的 4~5 秒正好用来下下一片，
+    # 下次请求即命中缓存（实测把单片 1~5s 的等待压到个位数毫秒）。
+    # 只缓存完整 200 的响应（206 内容不完整，不能复用）；存的是原始字节，
+    # 加密源命中后仍走上面的解密，不影响正确性。
+    if not client_range and body and (up is None or up.status_code == 200):
+        if up is not None:
+            _seg_cache_put(src_url, up.content, ctype or "video/mp2t")
+        _start_seg_prefetch(ext_client(request), picked or {}, src_url, headers)
     return Response(content=body, status_code=decrypt_resp_status, headers=h)
 
 
@@ -4055,10 +4290,27 @@ async def hls_compact(mg: str, request: Request):
     src_url = _hls_reg_get(rid, idx)
     if not src_url:
         return Response("expired", status_code=410)
+    client_range = request.headers.get("range")
+    # 预取命中（无 Range 时）：秒回，播放器不必等 CDN
+    if not client_range:
+        _hit = _seg_cache_get(src_url)
+        if _hit is None:
+            _hit = await _await_seg_prefetch(src_url)
+        if _hit is not None:
+            _hb, _hc = _hit
+            _start_prefetch(ext_client(request),
+                            _hls_reg_get(rid, idx + 1) or "", {},
+                            reg=(rid, idx + 1))
+            return Response(content=_hb, status_code=200, headers={
+                "Content-Type": _hc or "video/mp2t",
+                "Content-Length": str(len(_hb)),
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "max-age=2592000",
+            })
     fwd: dict = {}
     # 网盘 CDN 分片必须带登录 Cookie（裸取 412），按域名兜底注入
-    if request.headers.get("range"):
-        fwd["Range"] = request.headers["range"]
+    if client_range:
+        fwd["Range"] = client_range
     try:
         r = await ext_get_retry(request, src_url, fwd, tries=4, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
@@ -4078,6 +4330,11 @@ async def hls_compact(mg: str, request: Request):
     h["Access-Control-Allow-Origin"] = "*"
     h["Content-Length"] = str(len(body))
     h.setdefault("Content-Type", ctype or "video/mp2t")
+    # 交付后预取下一片（紧凑分片按注册表序号 +1，地址由服务端掌握）
+    if r.status_code == 200 and body and not client_range:
+        _seg_cache_put(src_url, body, ctype or "video/mp2t")
+        _start_prefetch(ext_client(request), _hls_reg_get(rid, idx + 1) or "",
+                        {}, reg=(rid, idx + 1))
     return Response(content=body, status_code=r.status_code, headers=h)
 
 
