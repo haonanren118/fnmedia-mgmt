@@ -505,6 +505,25 @@ if [ -f "$EXTRACT/manifest" ] && [ -d /var/apps/fnmedia-mgmt ]; then
     echo "[upd] WARN cannot sync appcenter manifest"
   fi
 fi
+# 同步应用中心数据库版本：manifest 只是文件，应用中心「当前版本」实际读的是
+# postgres 的 appcenter 库（app / app_package 两张表）。只改 manifest、不改库，
+# 界面上就永远是首次安装的那个版本号（实测重启服务也不会自愈）。
+SQLF=/tmp/fnmedia-update/appver.sql
+if [ -n "${{NEWVER:-}}" ] && command -v psql >/dev/null 2>&1; then
+  {{
+    printf "update app set version='%s', updated_at=now() where app_name='fnmedia-mgmt';\\n" "$NEWVER"
+    printf "update app_package set version='%s', updated_at=now() where app_name='fnmedia-mgmt';\\n" "$NEWVER"
+  }} > "$SQLF" 2>/dev/null || true
+  chmod 644 "$SQLF" 2>/dev/null || true
+  if su - postgres -c "psql -q -d appcenter -f $SQLF" >/dev/null 2>&1; then
+    echo "[upd] appcenter db version synced: $NEWVER"
+  else
+    echo "[upd] WARN cannot sync appcenter db version"
+  fi
+  rm -f "$SQLF"
+  # 应用中心进程内存里缓存了旧版本，重启后才会重新拉取
+  systemctl restart trim_app_center.service >/dev/null 2>&1 || true
+fi
 # 渲染 systemd 单元并重启（install.sh 内部会 daemon-reload/enable/restart）
 bash "$ROOT/deploy/install.sh" || fail "install.sh 启动失败"
 sleep 3
