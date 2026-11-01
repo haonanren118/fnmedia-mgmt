@@ -49,6 +49,17 @@ h2.page-title{margin:4px 0 4px;font-size:20px}
 .card-title{font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .card-sub{color:var(--muted);font-size:13px;margin:0 0 12px}
 .hint{color:var(--muted);font-size:13px;margin:6px 0}
+.about-meta{color:var(--muted);font-size:12.5px;margin:8px 0 2px}
+/* 关于页「发现新版本」提示：可点击，直接带到更新区并立即检查 */
+.upd-tip{display:none;margin-top:10px;padding:10px 12px;border-radius:10px;
+  background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.38);
+  color:var(--ok,#16a34a);font-size:13px;line-height:1.5;cursor:pointer;
+  align-items:center;gap:8px;flex-wrap:wrap;transition:background .15s}
+.upd-tip:hover{background:rgba(34,197,94,.2)}
+.upd-tip b{font-weight:600}
+/* 侧边栏「关于」上的小红点，提示有新版本 */
+.navdot{display:none;width:7px;height:7px;border-radius:50%;
+  background:#ef4444;position:absolute;top:9px;margin-left:5px}
 .muted{color:var(--muted)}.sm{font-size:12px}
 .stack{display:flex;flex-direction:column;gap:8px}
 .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
@@ -245,7 +256,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       <button class="nav-item" data-page="sources">资源站</button>
       <button class="nav-item" data-page="importsub">导入订阅</button>
       <button class="nav-item" data-page="search">搜索</button>
-      <button class="nav-item" data-page="about">关于</button>
+      <button class="nav-item" data-page="about">关于<span id="navAboutDot" class="navdot"></span></button>
     </nav>
     <div class="sidebar-foot">
       <span id="globalState" class="dot wait">检测中…</span>
@@ -636,6 +647,8 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           <div>· 海量片库：苹果 CMS 分类深翻，跨源聚合成海量五库（含短剧）与单源独立库。</div>
         </div>
         <div class="hint" id="aboutEdition"></div>
+        <div class="about-meta" id="aboutVer"></div>
+        <div class="upd-tip" id="aboutUpd" role="button" tabindex="0"></div>
       </div>
 
       <div class="card" id="updCard">
@@ -759,9 +772,28 @@ async function loadUpdate(force){
     if(rf){rf.disabled=false;rf.textContent="重新检查";}
   }
 }
+/* 关于页的「发现新版本」提示 + 侧边栏红点。
+   本来只有当用户主动进「关于」页才会检查更新，别处根本看不到有没有新版；
+   这里把结果统一反映到关于页卡片和导航上，随时能注意到。 */
+function syncUpdateTip(r){
+  const ver=$u("aboutVer"),tip=$u("aboutUpd"),dot=$u("navAboutDot");
+  if(ver)ver.textContent="当前版本 v"+((r&&r.current_version)||"—")+" · "+updEdLabel(r&&r.edition);
+  const u=r&&r.update,uav=!!(u&&u.update_available);
+  if(dot)dot.style.display=uav?"inline-block":"none";
+  if(!tip)return;
+  if(uav){
+    tip.style.display="flex";
+    tip.innerHTML='<span>🎉 发现新版本 <b>v'+esc(u.version)+'</b></span>'
+      +'<span class="muted" style="font-size:12px">点击查看并更新</span>';
+    tip.title="发现新版本 v"+u.version+"，点击查看";
+  }else{
+    tip.style.display="none";tip.innerHTML="";tip.title="";
+  }
+}
 function renderUpdate(r){
   $u("updCur").textContent=r.current_version||"—";
   $u("updEdition").textContent=" · "+updEdLabel(r.edition);
+  syncUpdateTip(r);
   const u=r.update;
   const busy=["checking","downloading","installing"].includes(r.status);
   const body=$u("updBody"),actions=$u("updActions"),btn=$u("updBtn"),
@@ -1843,7 +1875,22 @@ async function init(){
   renderOverview();
   loadWhoami();
   startLivePoll();
+  // 静默读一次更新状态：只看缓存、不触发 GitHub 请求，用于点亮「关于」红点
+  try{syncUpdateTip(await jget("/v/api/ext/update/status"));}catch(_){}
 }
+(function(){
+  const tip=$u("aboutUpd");
+  if(!tip)return;
+  const go=()=>{
+    const c=$u("updCard");
+    if(c&&c.scrollIntoView)c.scrollIntoView({behavior:"smooth",block:"center"});
+    loadUpdate(true);
+  };
+  tip.addEventListener("click",go);
+  tip.addEventListener("keydown",e=>{
+    if(e.key==="Enter"||e.key===" "){e.preventDefault();go();}
+  });
+})();
 $("liveClear").addEventListener("click",async e=>{e.preventDefault();
   try{await fetch("/v/api/ext/live/clear",{method:"POST"});await loadLive();toast("已清空实时记录");}catch(_){}});
 $("liveCopy").addEventListener("click",e=>{e.preventDefault();copyDiagnosis();});

@@ -442,6 +442,9 @@ fail(){{ echo "[upd] FAIL: $*"; echo "FAIL $*" > "$MARK"; exit 1; }}
 rm -rf "$EXTRACT"; mkdir -p "$EXTRACT"
 # fpk 外层为 tar.gz，内层 app.tgz 内是 repo/
 tar xzf "$PKG" -C "$EXTRACT" app.tgz || fail "解开 fpk 失败"
+# 同时解出包内 manifest —— 应用中心的版本号就靠它回写，少解这一个文件会导致
+# 「代码升级成功、应用中心仍显示首次安装版本」。
+tar xzf "$PKG" -C "$EXTRACT" manifest 2>/dev/null || echo "[upd] WARN 包内无 manifest"
 tar xzf "$EXTRACT/app.tgz" -C "$EXTRACT" || fail "解开 app.tgz 失败"
 [ -f "$EXTRACT/repo/deploy/install.sh" ] || fail "包内缺少 repo/deploy/install.sh"
 [ -f "$EXTRACT/repo/VERSION" ] || fail "包内缺少 VERSION"
