@@ -5462,17 +5462,31 @@ async def ext_import_subscription(request: Request):
                    for x in skipped):
             skipped.append({"name": nm, "reason": "探测不可达"})
 
-    # ---------- csp_*Guard 加固源（仅完整私有构建） ----------
+    # ---------- 需要外部运行时的源（本构建无 Android/Node 运行时） ----------
+    # 加固 / 普通爬虫 / 远程 drpy 三类站点依赖 redroid + spider.jar 或 Node sidecar，
+    # 当前构建不具备执行能力。它们既不能导入，也必须计入结果 —— 否则用户看到的
+    # 「扫描 N / 跳过 M」对不上账，剩下那批源会凭空消失、无法判断为什么装不上。
     guard_report = None
-    runtime = None
-
-    # ---------- 普通 csp_ 爬虫 与 远程 drpyS（仅完整私有构建） ----------
     csp_report = None
     drpy_report = None
+    runtime = None
 
-    if cms_added or (guard_report and guard_report.get("enabled_count")) \
-            or (csp_report and csp_report.get("added")) \
-            or (drpy_report and drpy_report.get("added")):
+    no_runtime: list[dict] = []
+    for _s in guard_sites:
+        if isinstance(_s, dict):
+            no_runtime.append({
+                "name": str(_s.get("name") or _s.get("key") or "未命名")[:24],
+                "reason": "加固源·需 Android 运行时"})
+    for _it in csp_items:
+        no_runtime.append({
+            "name": str(_it.get("name") or _it.get("key") or "未命名")[:24],
+            "reason": "爬虫源·需 Android 运行时"})
+    for _it in drpy_items:
+        no_runtime.append({
+            "name": str(_it.get("name") or "drpy")[:24],
+            "reason": "远程JS源·需 Node 运行时"})
+
+    if cms_added:
         _search_cache.clear()
         _schedule_routes_refresh()
 
@@ -5491,6 +5505,8 @@ async def ext_import_subscription(request: Request):
         "runtime": runtime,
         "skipped": len(skipped),
         "skipped_detail": skipped[:60],
+        "no_runtime": len(no_runtime),
+        "no_runtime_detail": no_runtime[:80],
         "ad_rules_added": ad_rules_added,
     }}
 

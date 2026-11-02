@@ -1724,8 +1724,21 @@ function renderSubResult(d){
   const cspOk=(csp.items||[]).filter(x=>x.enabled).length;
   const drOk=(dr.items||[]).filter(x=>x.enabled).length;
   const totalOk=cmsOk+gOk+cspOk+drOk;
+  const noRt=d.no_runtime||0, nor=d.no_runtime_detail||[], skNo=d.skipped||skips.length;
   h+='<div style="margin:8px 0;font-weight:600">共扫描 '+(d.scanned||0)+' 个站点'
-    +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'，新增可直接使用 <b style="color:var(--ok,#3a9)">'+totalOk+'</b> 个。</div>';
+    +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'：新增可直接使用 <b style="color:var(--ok,#3a9)">'+totalOk+'</b> 个'
+    +(skNo?(' · 跳过 '+skNo+' 个'):'')
+    +(noRt?(' · 需外部运行时 <b style="color:var(--warn,#d59a2b)">'+noRt+'</b> 个'):'')+'。</div>';
+  // 一个可用源都没有时，直接说清是"订阅类型不匹配"，而不是让用户看着 0 猜
+  if(!totalOk && noRt){
+    h+='<div style="margin:10px 0;padding:10px 12px;border:1px solid var(--warn,#d59a2b);border-radius:8px;background:rgba(213,154,43,.08)">'
+     + '<div style="font-weight:600;margin-bottom:4px">该订阅中没有本构建可直接使用的源</div>'
+     + '<div class="muted sm">扫描 '+esc(String(d.scanned||0))+' 个站点，其中 '+noRt
+     + ' 个依赖 Android 爬虫运行时（spider.jar / dex）或 Node 远程脚本引擎，本构建不含这些运行时，'
+     + '因此无法导入（这是能力限制，不是源失效）。</div>'
+     + '<div class="muted sm" style="margin-top:4px">需要立即可播的源，请用上方「一键轻量猫源」，'
+     + '或导入接口形如 <code>/api.php/provide/vod</code> 的苹果CMS订阅（type 0/1）。</div></div>';
+  }
   // 苹果CMS
   if(cms.candidates||cms.added||cms.duplicate){
     h+='<div class="subgrp"><div class="subgrp-t">🍿 苹果CMS影视站　新增 '+cmsOk+' · 已存在 '+(cms.duplicate||0)+'</div>';
@@ -1790,9 +1803,16 @@ function renderSubResult(d){
   if(dr && dr.error){h+='<div class="hint" style="color:var(--danger)">远程JS导入失败：'+esc(dr.error)+'</div>';}
   // 跳过
   if(skips.length){
-    h+='<details class="subgrp" style="margin-top:8px"><summary class="subgrp-t" style="cursor:pointer">⏭️ 跳过 '+ (d.skipped||skips.length) +' 个（网盘/直播/无法识别/探测失败）</summary>';
+    h+='<details class="subgrp" style="margin-top:8px"><summary class="subgrp-t" style="cursor:pointer">⏭️ 跳过 '+ skNo +' 个（网盘/直播/无法识别/探测失败）</summary>';
     const by={};skips.forEach(s=>{const r=s.reason||"其他";(by[r]=by[r]||[]).push(s.name);});
     Object.keys(by).forEach(r=>{h+='<div class="subrow muted"><span>'+esc(by[r].slice(0,10).join("、"))+(by[r].length>10?" 等":"")+'</span><span class="tag">'+esc(r)+'</span></div>';});
+    h+='</details>';
+  }
+  // 需外部运行时：已识别但本构建无法执行，如实列出，避免"凭空消失"
+  if(nor.length){
+    h+='<details class="subgrp" style="margin-top:8px"><summary class="subgrp-t" style="cursor:pointer">🧩 需外部运行时 '+ noRt +' 个（本构建不支持，未导入）</summary>';
+    const byr={};nor.forEach(s=>{const r=s.reason||"其他";(byr[r]=byr[r]||[]).push(s.name);});
+    Object.keys(byr).forEach(r=>{h+='<div class="subrow muted"><span>'+esc(byr[r].slice(0,10).join("、"))+(byr[r].length>10?" 等":"")+'</span><span class="tag warn">'+esc(r)+'</span></div>';});
     h+='</details>';
   }
   $("subResult").innerHTML=h;
