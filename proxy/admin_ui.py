@@ -221,8 +221,14 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
     background:rgba(255,255,255,.97);border-top:1px solid var(--line);backdrop-filter:blur(6px);
     padding-bottom:env(safe-area-inset-bottom,0px)}
   .bottom-nav .nav-item{flex:1;display:flex;align-items:center;justify-content:center;
-    height:58px;text-align:center;padding:0 2px;font-size:12px;border-radius:0;white-space:nowrap}
+    height:58px;text-align:center;padding:0 1px;font-size:11px;border-radius:0;
+    white-space:nowrap;min-width:0}
   .bottom-nav .nav-item.active{background:transparent;color:var(--accent);font-weight:700}
+  /* 底部导航 7 项，红点改成行内定位，避免 absolute 压住文字 */
+  .bottom-nav .navdot{position:static;top:auto;margin-left:2px;margin-top:-8px}
+}
+@media(max-width:360px){
+  .bottom-nav .nav-item{font-size:10px;padding:0}
 }
 /* 加固影视浏览：海报墙 + 播放器 */
 .gb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;margin-top:6px}
@@ -694,7 +700,9 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
   <button class="nav-item" data-page="library">媒体库</button>
   <button class="nav-item" data-page="quality">质量</button>
   <button class="nav-item" data-page="sources">资源站</button>
+  <button class="nav-item" data-page="importsub">订阅</button>
   <button class="nav-item" data-page="search">搜索</button>
+  <button class="nav-item" data-page="about">关于<span id="navAboutDotM" class="navdot"></span></button>
 </nav>
 
 <div id="toast"></div>
@@ -776,10 +784,12 @@ async function loadUpdate(force){
    本来只有当用户主动进「关于」页才会检查更新，别处根本看不到有没有新版；
    这里把结果统一反映到关于页卡片和导航上，随时能注意到。 */
 function syncUpdateTip(r){
-  const ver=$u("aboutVer"),tip=$u("aboutUpd"),dot=$u("navAboutDot");
+  const ver=$u("aboutVer"),tip=$u("aboutUpd");
+  /* 侧栏与手机底栏各有一个「关于」，两处红点同步 */
+  const dots=[$u("navAboutDot"),$u("navAboutDotM")];
   if(ver)ver.textContent="当前版本 v"+((r&&r.current_version)||"—")+" · "+updEdLabel(r&&r.edition);
   const u=r&&r.update,uav=!!(u&&u.update_available);
-  if(dot)dot.style.display=uav?"inline-block":"none";
+  dots.forEach(d=>{if(d)d.style.display=uav?"inline-block":"none";});
   if(!tip)return;
   if(uav){
     tip.style.display="flex";

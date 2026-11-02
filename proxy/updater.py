@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -124,27 +125,55 @@ def edition_full() -> bool:
 
 # --------------------------------------------------------------- GitHub
 
+def _local_arch() -> str:
+    """本机架构族：arm / x86。
+
+    包本身是纯 Python（wheelhouse 内同时带 aarch64 与 x86_64 原生 wheel，
+    由目标机 pip 自行匹配），所以包跨架构通用；这里只用于在 Release 同时
+    挂出架构专属包时，优先取与当前设备一致的那个，绝不取另一个。
+    """
+    m = (platform.machine() or "").lower()
+    if m.startswith(("arm", "aarch")):
+        return "arm"
+    return "x86"
+
+
 def _pick_asset(assets: list[dict], full: bool) -> dict | None:
     """在 Release 附件里挑目标安装包。
 
-    全功能版：fnmedia-mgmt-<ver>-full.fpk
-    轻量版：fnmedia-mgmt-<ver>.fpk（排除 -full / -lite / -public），
-            找不到则退回 -lite.fpk。
+    全功能版：fnmedia-mgmt-<ver>[-<arch>]-full.fpk
+    轻量版：fnmedia-mgmt-<ver>[-<arch>].fpk（排除 -lite / -public 别名）
+
+    架构规则：优先本机架构的专属包，其次取不带架构后缀的通用包（platform=all）；
+    另一架构的包一律不取 —— 避免把架构不匹配的包装上机后起不来。
     """
-    lite_plain = lite_alt = full_pkg = None
+    want = _local_arch()
+    plain: dict[str, dict] = {}
+    fulls: dict[str, dict] = {}
+    lite_alt: dict | None = None
     for a in assets:
         name = a.get("name") or ""
         if not name.endswith(".fpk"):
             continue
-        if re.search(r"-full\.fpk$", name):
-            full_pkg = a
-        elif re.search(r"-(lite|public)\.fpk$", name):
-            lite_alt = a
-        elif re.match(r"^fnmedia-mgmt-.+\.fpk$", name):
-            lite_plain = a
+        stem = name[:-4]
+        is_full = stem.endswith("-full")
+        base = stem[:-5] if is_full else stem
+        if not is_full and base.endswith(("-lite", "-public")):
+            lite_alt = lite_alt or a
+            continue
+        arch = ""
+        for t in ("arm", "x86"):
+            if base.endswith("-" + t):
+                arch, base = t, base[: -(len(t) + 1)]
+                break
+        if not base.startswith("fnmedia-mgmt-"):
+            continue
+        if arch and arch != want:
+            continue                      # 另一架构：直接排除
+        (fulls if is_full else plain)[arch] = a
     if full:
-        return full_pkg
-    return lite_plain or lite_alt
+        return fulls.get(want) or fulls.get("")
+    return plain.get(want) or plain.get("") or lite_alt
 
 
 def _fetch_release_sync() -> dict | None:

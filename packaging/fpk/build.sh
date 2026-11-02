@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # fnmedia-mgmt FPK 打包：组装骨架 + 项目主体 → fnpack build → dist/*.fpk
-# 用法：packaging/fpk/build.sh [--public] [--stage-only DIR] [--fnpack /path] [--out dist]
-#   --public  公开包：只含通用公开能力（在全功能源码树上会先执行构建期裁剪）
+# 用法：packaging/fpk/build.sh [--public] [--platform all|arm|x86] [--stage-only DIR] [--fnpack /path] [--out dist]
+#   --public    公开包：只含通用公开能力（在全功能源码树上会先执行构建期裁剪）
+#   --platform  目标架构（写进 manifest 的 platform 字段，并作为产物文件名后缀）：
+#                 all（默认，platform=all，双架构通用；产物 fnmedia-mgmt-<ver>.fpk）
+#                 arm / x86（架构专属包；产物 fnmedia-mgmt-<ver>-<arch>.fpk）
+#                本应用是纯 Python，无 ELF 产物，wheelhouse 同时内置 aarch64 与
+#                x86_64 原生 wheel，故 all 包在两个架构上都能装；专属包仅用于
+#                按飞牛官方惯例明确分发。
 set -euo pipefail
 
 FPK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,15 +16,21 @@ VERSION="$(head -n1 "${REPO_ROOT}/VERSION" | tr -d '[:space:]')"
 [ -n "${VERSION}" ] || { echo "ERROR: 无法读取 VERSION" >&2; exit 1; }
 
 FNPACK_BIN="${FNPACK:-}"; STAGE=""; STAGE_ONLY=0; OUT_DIR="${REPO_ROOT}/dist"; PUBLIC=0
+PLATFORM="all"
 while [ $# -gt 0 ]; do
   case "$1" in
     --stage-only) STAGE_ONLY=1; STAGE="$2"; shift 2 ;;
     --fnpack) FNPACK_BIN="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
+    --platform) PLATFORM="$2"; shift 2 ;;
     --public) PUBLIC=1; shift ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
+case "${PLATFORM}" in
+  all|arm|x86) ;;
+  *) echo "ERROR: --platform 只能是 all / arm / x86（收到: ${PLATFORM}）" >&2; exit 1 ;;
+esac
 [ -n "${STAGE}" ] || STAGE="${FPK_DIR}/.build/fpk"
 command -v rsync >/dev/null 2>&1 || { echo "ERROR: 需要 rsync" >&2; exit 1; }
 
@@ -114,7 +126,8 @@ if [ "${PUBLIC}" -eq 1 ] && [ -f "${STAGE}/app/repo/tools/public_strip.py" ]; th
 fi
 
 MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-sed "s/@VERSION@/${MANIFEST_VER}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
+sed -e "s/@VERSION@/${MANIFEST_VER}/" -e "s/@PLATFORM@/${PLATFORM}/" \
+  "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/" 2>/dev/null || true
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
 cp -a "${FPK_DIR}/cmd" "${STAGE}/cmd"
@@ -143,7 +156,10 @@ BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev
 [ -n "${BUILT}" ] || { echo "ERROR: fnpack 未产出 .fpk" >&2; exit 1; }
 mkdir -p "${OUT_DIR}"
 SUFFIX=""; [ "${PUBLIC}" -eq 1 ] && SUFFIX="-public"
+# all 包不加架构后缀（热更新按 fnmedia-mgmt-<ver>.fpk 精确匹配）；
+# arm/x86 专属包加后缀，供应用中心按设备架构分发。
+[ "${PLATFORM}" != "all" ] && SUFFIX="${SUFFIX}-${PLATFORM}"
 FINAL="${OUT_DIR}/fnmedia-mgmt-${VERSION}${SUFFIX}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )
-echo "[fpk] 打包完成: ${FINAL}"
+echo "[fpk] 打包完成: ${FINAL} (platform=${PLATFORM})"

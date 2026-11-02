@@ -2,7 +2,7 @@
 
 飞牛影视（trim.media）在线资源扩展的**管理端**。零侵入、可逆地接管官方影视入口，在原生搜索与媒体库中注入在线影视，并用飞牛自带播放器直接播放。
 
-- **版本**：0.0.8
+- **版本**：0.0.9
 - **作者**：haonanren118
 - **应用标识**：`fnmedia-mgmt`
 
@@ -36,9 +36,26 @@
 命令行安装（需 root）：
 
 ```bash
-sudo appcenter-cli install-fpk fnmedia-mgmt-0.0.8.fpk -v 1 -e ./env.txt
+sudo appcenter-cli install-fpk fnmedia-mgmt-0.0.9.fpk -v 1 -e ./env.txt
 # env.txt 内容：wizard_agree_terms=agree
 ```
+
+### 架构（x86 / ARM）
+
+本应用是纯 Python 实现，**包内没有任何 ELF 二进制**，运行时依赖由随包 `wheelhouse`
+提供 —— 里面同时内置了 `aarch64` 与 `x86_64` 两套 `pydantic_core` 原生 wheel，
+安装时由目标机的 pip 自行匹配。因此：
+
+| 包 | manifest | 适用 |
+|---|---|---|
+| `fnmedia-mgmt-<ver>.fpk` | `platform = all` | x86_64 与 ARM 通用，**推荐** |
+| `fnmedia-mgmt-<ver>-arm.fpk` | `platform = arm` | ARM 设备，按官方惯例明确分发 |
+| `fnmedia-mgmt-<ver>-x86.fpk` | `platform = x86` | x86_64 设备，同上 |
+
+三个包内容完全一致，只是 manifest 的 `platform` 字段不同；ARM 用户装通用包同样可用。
+要求目标机 **Python 3.11**（飞牛 fnOS 基于 Debian 12，x86 与 ARM 版均为 3.11）。
+若设备 Python 版本不同，离线 wheelhouse 会因 `pydantic_core` 无对应 ABI 而跳过，
+自动转国内镜像在线安装。
 
 ## ⚠️ 与上游版本不能同时运行
 
