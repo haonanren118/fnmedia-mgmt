@@ -35,6 +35,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
 
 import features
 import netutil
+import playcfg
 import providers
 import sourcehealth
 import spiders as spidermod
@@ -2753,6 +2754,26 @@ async def person_list(guid: str, request: Request):
     if not store.get_title_by_guid(guid) and not store.get_episode(guid):
         return await forward_upstream(request)
     return JSONResponse({"code": 0, "msg": "", "data": {"total": 0, "list": []}})
+
+
+@app.post("/v/api/v1/play/setConfigByItem")
+async def play_set_config(request: Request):
+    """片头片尾设置：本地旁路记一份，同时照常透传上游。
+
+    官方后端把这套配置挂在媒体库条目上，我们注入的在线条目在库里不存在，上游
+    虽然返回成功但存不进去，于是设置完当次有效、退出重进就复位。本地记一份，
+    播放时由 play/info 的 play_config 回填（见 proxy/playcfg.py）。本地片不受
+    影响：仍然原样走上游。
+    """
+    import json
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except Exception:
+        body = {}
+    if isinstance(body, dict):
+        playcfg.update(body.get("guid"), body.get("skip_opening"),
+                       body.get("skip_ending"))
+    return await forward_upstream(request)
 
 
 @app.post("/v/api/v1/play/record")
@@ -5835,6 +5856,64 @@ async def source_health_reset(request: Request):
 
 
 
+# ------------------------------------------------------- 写请求审计（诊断用）
+# 飞牛 App 的「用户标记」（收藏 / 已看 / 片头片尾）会回写官方后端，而官方库里
+# 没有我们注入的虚拟条目。要确认它究竟调哪个接口、带哪些字段，就把打到官方
+# API 的写请求按环形缓冲记下来，事后用 GET /v/api/ext/api-audit 查看。
+# 只在未匹配到本地路由（本函数）时记录，正常播放链路零开销。
+_AUDIT_MAX = 300
+_AUDIT_FILE = Path(__file__).resolve().parent.parent / "state" / "api_audit.jsonl"
+_AUDIT_LOCK = threading.Lock()
+_AUDIT_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+
+def _audit_append(rec: dict) -> None:
+    try:
+        with _AUDIT_LOCK:
+            lines: list[str] = []
+            if _AUDIT_FILE.exists():
+                try:
+                    lines = _AUDIT_FILE.read_text(
+                        encoding="utf-8", errors="replace").splitlines()
+                except Exception:
+                    lines = []
+            lines.append(json.dumps(rec, ensure_ascii=False))
+            if len(lines) > _AUDIT_MAX:
+                lines = lines[-_AUDIT_MAX:]
+            _AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _AUDIT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+@app.get("/v/api/ext/api-audit")
+async def ext_api_audit(request: Request):
+    """最近打到官方后端、未被本地接管的写请求（定位片头片尾等标记接口）。"""
+    rows = []
+    try:
+        if _AUDIT_FILE.exists():
+            raw = _AUDIT_FILE.read_text(encoding="utf-8", errors="replace")
+            for line in raw.splitlines()[-100:]:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {"code": 0, "msg": "", "data": {"count": len(rows), "rows": rows}}
+
+
+@app.post("/v/api/ext/restart")
+async def ext_restart(request: Request):
+    """只重启服务，不清任何缓存（部署新代码后用）。"""
+    def _restart():
+        time.sleep(0.8)
+        os.system("systemctl restart fnmedia-mgmt >/dev/null 2>&1 &")
+
+    threading.Thread(target=_restart, daemon=True).start()
+    return {"code": 0, "msg": "服务重启中"}
+
+
 # ------------------------------------------------------------- 兜底透传
 
 @app.api_route("/{full_path:path}",
@@ -5842,4 +5921,29 @@ async def source_health_reset(request: Request):
 async def catch_all(request: Request, full_path: str):
     # 本地视频/文件等大响应必须流式透传（不缓冲整文件），避免打满内存拖死系统；
     # 该函数内部对普通 JSON 自动回落到缓冲透传。
-    return await forward_upstream_streaming(request)
+    p = request.url.path
+    audit = p.startswith("/v/api/v1/") and request.method in _AUDIT_METHODS
+    preview = ""
+    if audit:
+        try:
+            clen = int(request.headers.get("content-length") or 0)
+        except (TypeError, ValueError):
+            clen = 0
+        # 只预读小 body：这里缓存进 request._body，后续 forward 仍能读到同一份。
+        if 0 < clen <= 65536:
+            try:
+                preview = (await request.body())[:800].decode("utf-8", "replace")
+            except Exception:
+                preview = ""
+    resp = await forward_upstream_streaming(request)
+    if audit:
+        _audit_append({
+            "ts": int(time.time()),
+            "method": request.method,
+            "path": p,
+            "query": request.url.query[:200],
+            "status": getattr(resp, "status_code", 0),
+            "ua": request.headers.get("user-agent", "")[:100],
+            "body": preview,
+        })
+    return resp

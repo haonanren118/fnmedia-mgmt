@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64 as _b64
 
 import providers
+import playcfg
 from store import (make_guid, media_guid, video_guid,
                    season_guid, episode_guid, ep_media_guid, ep_video_guid)
 
@@ -330,11 +331,15 @@ def play_info(b: dict) -> dict:
 def episode_play_info(ep: dict) -> dict:
     """对伪造 Episode 的 play/info：media/video guid 与该集绑定。"""
     eg = ep["ep_guid"]
+    # 片头片尾：客户端设置时用它拿到的 parent_guid（= 本剧的 season guid）作为
+    # 归属，播放时又从本接口的 play_config 读回。官方库没有这条虚拟记录，写不
+    # 进去，所以由 playcfg 在本地接管（见 proxy/playcfg.py）。
+    sk = ep.get("season_guid", "")
     return {
         "grand_guid": "",
         "guid": eg,
-        "parent_guid": ep.get("season_guid", ""),
-        "play_config": None,
+        "parent_guid": sk,
+        "play_config": playcfg.get(sk),
         "ts": 0,
         "type": "Episode",
         "video_guid": ep_video_guid(eg),
