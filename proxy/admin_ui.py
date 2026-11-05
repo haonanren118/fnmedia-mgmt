@@ -1795,16 +1795,28 @@ function renderSubResult(d){
   // 只有 jar 已转好、且没被 native 阻断的源才真正能搜能播；其余（待准备 /
   // 缺 jar / 需 Android / 转换失败）单独报数，不能算进"可直接使用"。
   const cspOk=cspItems.filter(x=>x.enabled&&x.status==="ready").length;
-  const cspN=cspItems.length, cspWait=cspN-cspOk;
+  const cspN=cspItems.length, cspWaitN=cspN-cspOk;
   const drOk=(dr.items||[]).filter(x=>x.enabled).length;
   const totalOk=cmsOk+gOk+cspOk+drOk;
   const noRt=d.no_runtime||0, nor=d.no_runtime_detail||[], skNo=d.skipped||skips.length;
+  // 按"站点去向"互斥计数，各项相加应等于扫描数。以前只报新增/跳过/需运行时
+  // 三项，已存在的、超出探测上限的都不出现，494 个站点能对出 183 个。
+  const cmsDup=cms.duplicate||0, cmsOver=cms.overflow||0;
+  const tally=[[totalOk,"新增可直接使用","ok"],
+               [cmsDup,"已存在",""],
+               [cspWaitN,"爬虫源待准备","warn"],
+               [skNo,"跳过",""],
+               [noRt,"需 Android/Node 运行时","warn"],
+               [cmsOver,"超出单次探测上限","warn"]];
+  const tallySum=tally.reduce(function(a,x){return a+x[0];},0);
+  const tallyTxt=tally.filter(function(x){return x[0]>0;}).map(function(x){
+    const col=x[2]==="ok"?"var(--ok,#3a9)":(x[2]==="warn"?"var(--warn,#d59a2b)":"inherit");
+    return x[1]+' <b style="color:'+col+'">'+x[0]+'</b> 个';}).join(" · ");
   h+='<div style="margin:8px 0;font-weight:600">共扫描 '+(d.scanned||0)+' 个站点'
-    +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'：新增可直接使用 <b style="color:var(--ok,#3a9)">'+totalOk+'</b> 个'
-    +(cspN?(' · 爬虫源已登记 <b style="color:var(--accent,#4a9)">'+cspN+'</b> 个'
-      +(cspWait?('（就绪 '+cspOk+'，其余后台准备中）'):'')):'')
-    +(skNo?(' · 跳过 '+skNo+' 个'):'')
-    +(noRt?(' · 需 Android/Node 运行时 <b style="color:var(--warn,#d59a2b)">'+noRt+'</b> 个'):'')+'。</div>';
+    +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'：'+tallyTxt+'。'
+    +((tallySum!==(d.scanned||0))?('<div class="muted sm" style="font-weight:400">以上合计 '+tallySum
+      +' 个，与扫描数 '+(d.scanned||0)+' 的差额是订阅内被多次声明的同源站点（同一 api 出现多遍，导入时只处理一次）。</div>'):'')
+    +'</div>';
   // 一个可用源都没有时，直接说清是"订阅类型不匹配"，而不是让用户看着 0 猜
   if(!totalOk && !cspN && noRt){
     h+='<div style="margin:10px 0;padding:10px 12px;border:1px solid var(--warn,#d59a2b);border-radius:8px;background:rgba(213,154,43,.08)">'

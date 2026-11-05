@@ -5736,6 +5736,10 @@ async def ext_import_subscription(request: Request):
         "subscriptions": _subs,
         "cms": {
             "candidates": len(cms_cands),
+            # 单次最多探测 80 个，超出的既不新增也不计入任何一栏，会让
+            # 「扫描数」和下面几项加不起来。如实报出来，账才对得上。
+            "checked": len(checked),
+            "overflow": max(0, len(cms_cands) - len(checked)),
             "added": len(cms_added),
             "added_names": cms_added,
             "duplicate": cms_dup,
