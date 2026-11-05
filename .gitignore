@@ -42,6 +42,9 @@ dist/
 /proxy/spiders.py
 /proxy/assets/spiders/
 /proxy/assets/catvod/
+/proxy/spiderjvm.py
+/proxy/assets/dex2jar/
+/proxy/assets/stubgen/
 /proxy/assets/drpy/
 /proxy/assets/guard/
 # 用户导入的 TVBox 加固源配置（私有，含第三方 ext/凭证，绝不入库）

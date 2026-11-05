@@ -90,6 +90,10 @@ class Episode:
     # play_from 是该集所属线路标识，解码必须一并上送（公开构建下恒为 False）
     xsrc: bool = False
     play_from: str = ""
+    # 网盘分享（PanSou 索引）：非直链、也非网页播放页，必须用户把分享转存进
+    # 自己的网盘后才可能播。非空时 url 是分享地址，播放层据此给出提示，
+    # 而不是把它当成坏线去重试/换线（那只会白白耗掉起播预算）。
+    share: dict = field(default_factory=dict)
 
 
 @dataclass

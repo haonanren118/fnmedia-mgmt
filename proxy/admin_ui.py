@@ -549,6 +549,19 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div id="srcProxyMsg" class="muted sm" style="margin-top:6px"></div>
       </div>
       <div class="card">
+        <div class="card-title">🕷 爬虫源（TVBox csp / type=3）
+          <button class="small" style="float:right" onclick="prepareSpiders()">准备未完成的</button></div>
+        <p class="card-sub">订阅里的 <code>csp_*</code> 源。本构建用 <strong>JRE 直接运行它的 spider jar</strong>（dex 先转成 JVM 字节码），
+          <strong>不需要 Android 容器、不额外占内存</strong>。导入订阅时自动下载并转换；依赖 ARM 原生库（.so）的源在 JRE 上无法执行，
+          会标为「不可用」，属已知限制。爬虫源只在详情/媒体库搜索里参与（不进全局搜索框），避免拖慢秒回结果。</p>
+        <div id="spiderStat" class="muted sm">加载中…</div>
+        <div class="row" style="margin:8px 0">
+          <input type="text" id="spiderQ" placeholder="按名称筛选" style="flex:1" oninput="renderSpiderSites()"/>
+          <button class="small" onclick="loadSpiderMgmt()">刷新</button>
+        </div>
+        <div id="spiderList" style="max-height:320px;overflow:auto"></div>
+      </div>
+      <div class="card">
         <div class="card-title">🛡 播放去广告（m3u8 流层）
           <label style="float:right;display:flex;align-items:center;gap:6px;font-size:12px;font-weight:400;cursor:pointer">
             <input type="checkbox" id="adfEnable" style="width:14px;height:14px;accent-color:var(--accent)" onchange="toggleAdfilter(this.checked)"/> 启用去广告</label></div>
@@ -1529,6 +1542,63 @@ async function clearSubProxy(){
   else toast(r.msg||"失败","fail");
 }
 // ---------- 资源站取源代理（搜索/分类/测速，视频流仍直连） ----------
+/* ---------- 爬虫源（TVBox csp / type=3）---------- */
+let SPIDER_SITES=[], SPIDER_STAT=null;
+async function loadSpiderMgmt(){
+  try{const r=await fetch('/v/api/ext/spider/status');SPIDER_STAT=(await r.json()).data||null;}catch(e){SPIDER_STAT=null;}
+  try{const r=await fetch('/v/api/ext/spider/sites');SPIDER_SITES=(await r.json()).data||[];}catch(e){SPIDER_SITES=[];}
+  renderSpiderSites();
+}
+function _spiderGroup(list){
+  const g={ready:0,blocked:0,new:0,fail:0};
+  (list||[]).forEach(function(x){
+    if(x.status==='ready')g.ready++;
+    else if(x.native_blocked||x.status==='blocked')g.blocked++;
+    else if(x.status==='jar_missing'||x.status==='convert_failed')g.fail++;
+    else g.new++;
+  });
+  return g;
+}
+function renderSpiderSites(){
+  const box=document.getElementById('spiderList'); if(!box)return;
+  const g=_spiderGroup(SPIDER_SITES), j=(SPIDER_STAT||{}).jvm||{};
+  const st=document.getElementById('spiderStat');
+  if(st){
+    st.innerHTML='共 <b>'+SPIDER_SITES.length+'</b> 个 · 就绪 <b>'+g.ready+'</b> · 需 Android <b>'+g.blocked+
+      '</b> · 待准备 <b>'+g.new+'</b> · 失败 <b>'+g.fail+'</b><br>运行环境：JRE '+(j.available?'✅':'❌')+
+      ' · 转换器 '+(j.dex2jar?'✅':'❌')+' · 已缓存 '+((j.cached)||0)+' 个 jar'+
+      (j.sidecar_running?' · 进程已启动':'');
+  }
+  const q=(document.getElementById('spiderQ')||{}).value||'';
+  const rows=(SPIDER_SITES||[]).filter(function(x){return !q||String(x.name||'').toLowerCase().indexOf(q.toLowerCase())>=0;}).slice(0,200);
+  if(!rows.length){box.innerHTML='<div class="muted sm">暂无爬虫源。导入含 csp_ 源的订阅后会自动出现在这里。</div>';return;}
+  box.innerHTML=rows.map(function(x){
+    const ok=x.status==='ready';
+    const color=ok?'#3fb950':(x.native_blocked?'#d29922':'#8b949e');
+    const label=({ready:'就绪',blocked:'需 Android',jar_missing:'jar 缺失',convert_failed:'转换失败',new:'待准备'})[x.status]||x.status;
+    return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(128,128,128,.15)">'+
+      '<label style="display:flex;align-items:center;gap:6px;flex:1;min-width:0;cursor:pointer">'+
+      '<input type="checkbox" data-key="'+String(x.key).replace(/"/g,'&quot;')+'" '+(x.enabled?'checked':'')+
+      ' onchange="toggleSpider(this)" style="width:14px;height:14px"/>'+
+      '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(x.name||x.key)+'</span></label>'+
+      '<span class="sm" style="color:'+color+';white-space:nowrap">'+label+'</span></div>';
+  }).join('');
+}
+async function toggleSpider(el){
+  try{await fetch('/v/api/ext/spider/toggle',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:el.dataset.key,enabled:el.checked})});}catch(e){}
+  loadSpiderMgmt();
+}
+async function prepareSpiders(){
+  try{
+    const r=await fetch('/v/api/ext/spider/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    const st=document.getElementById('spiderStat');
+    if(st)st.innerHTML='已排队准备 '+((j.data||{}).queued||0)+' 个源，正在下载并转换 jar（每个约 3~10 秒）…';
+  }catch(e){}
+  setTimeout(loadSpiderMgmt,5000);
+}
+
 function initSrcProxy(){
   const p=(CFG&&CFG.source_proxy)||"";
   const en=$("srcProxyEnable"),inp=$("srcProxyUrl"),sb=$("srcProxySaveBtn"),cb=$("srcProxyClearBtn"),msg=$("srcProxyMsg");

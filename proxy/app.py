@@ -37,6 +37,7 @@ import features
 import netutil
 import providers
 import sourcehealth
+import spiders as spidermod
 import client as clientmod
 import live as livemod
 import inject as inj
@@ -870,6 +871,143 @@ async def forward_upstream_streaming(request: Request) -> Response:
 
 # ------------------------------------------------------------- 在线搜索
 
+# ---------------------------------------------------------------- 爬虫源（JVM）
+# csp_* 源在 jar 里，播放接口要的是「线路 + 该线路下的集 id」，search 只给到影片
+# 级 id，所以每个命中条目还要再 detail 一次才能展开选集。地址用 spider:// 前缀
+# 打包成一条不透明 uri，播放层见前缀即回调 JVM 解析成真实媒体地址——这样
+# store / 线路菜单 / 选速逻辑都不必为它新增字段或特判。
+SPIDER_SCHEME = "spider://"
+
+
+def _spider_url(key: str, flag: str, vid: str) -> str:
+    q = urllib.parse.quote
+    return f"{SPIDER_SCHEME}{q(key, safe='')}/{q(flag or '', safe='')}/{q(vid, safe='')}"
+
+
+def _spider_parse(url: str):
+    """spider://<key>/<flag>/<vid> → (key, flag, vid)；不是本协议返回 None。"""
+    if not url or not url.startswith(SPIDER_SCHEME):
+        return None
+    rest = url[len(SPIDER_SCHEME):]
+    parts = rest.split("/", 2)
+    if len(parts) < 3:
+        return None
+    uq = urllib.parse.unquote
+    return uq(parts[0]), uq(parts[1]), uq(parts[2])
+
+
+async def _spider_titles(keyword: str, max_hits: int = 2,
+                         per_timeout: float = 12.0,
+                         max_sites: int | None = None,
+                         budget: float = 15.0) -> list:
+    """把已就绪的 csp 爬虫源并入在线搜索。
+
+    每个源先 search，命中的前 max_hits 条再 detail 展开分集。detail 失败的条目
+    直接丢弃——只给影片名却点不进去的条目，比不显示更糟。
+    """
+    if not features.CATVOD:
+        return []
+    try:
+        sites = spidermod.ready_sites()
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("爬虫源不可用: %s", exc)
+        return []
+    if not sites:
+        return []
+    if max_sites:
+        sites = sites[:max_sites]
+
+    async def one(site_conf: dict) -> list:
+        try:
+            hits = await asyncio.wait_for(
+                asyncio.to_thread(spidermod.search_site, site_conf, keyword),
+                per_timeout)
+        except Exception:  # noqa: BLE001
+            return []
+        out = []
+        for h in (hits or [])[:max_hits]:
+            if not isinstance(h, dict):
+                continue
+            vid = str(h.get("vod_id") or h.get("vodId") or "")
+            if not vid:
+                continue
+            try:
+                det = await asyncio.wait_for(
+                    asyncio.to_thread(spidermod.detail_site, site_conf, vid),
+                    per_timeout)
+            except Exception:  # noqa: BLE001
+                continue
+            eps = spidermod.parse_episodes(det or {})
+            if not eps:
+                continue
+            lines: dict[str, list] = {}
+            for e in eps:
+                lines.setdefault(e["line"], []).append(
+                    providers.Episode(
+                        title=e["title"],
+                        url=_spider_url(site_conf["key"], e["line"], e["id"]),
+                        direct=True, xsrc=True))
+            out.append(providers.OnlineTitle(
+                provider=f"spider-{site_conf['key']}",
+                vod_id=vid,
+                title=str(det.get("vod_name") or h.get("vod_name") or "")[:60],
+                type_name=str(det.get("type_name") or h.get("type_name") or ""),
+                year=str(det.get("vod_year") or h.get("vod_year") or ""),
+                area=str(det.get("vod_area") or ""),
+                updated=str(det.get("vod_time") or ""),
+                remarks=str(det.get("vod_remarks") or h.get("vod_remarks") or ""),
+                score=str(det.get("vod_score") or ""),
+                poster=str(det.get("vod_pic") or h.get("vod_pic") or ""),
+                overview=str(det.get("vod_content") or "")[:400],
+                actor=str(det.get("vod_actor") or ""),
+                director=str(det.get("vod_director") or ""),
+                sources=lines))
+        return out
+
+    # 整体预算而不是等所有源：慢源（实测有单源 29s）不该把已经拿到结果的快源
+    # 一起拖到超时。到点先返回已完成的部分，未完成的取消掉，下次搜索再说。
+    tasks = [asyncio.create_task(one(s)) for s in sites]
+    done, pending = await asyncio.wait(tasks, timeout=budget)
+    for t in pending:
+        t.cancel()
+    titles = []
+    for t in done:
+        if t.cancelled() or t.exception():
+            continue
+        r = t.result()
+        if isinstance(r, list):
+            titles.extend(r)
+    if pending:
+        _log.debug("爬虫源搜索超出 %.0fs 预算，跳过 %d 个未完成源", budget, len(pending))
+    return titles
+
+
+async def _prepare_spiders_bg(keys: list[str]):
+    """把爬虫源准备到可调用状态：下载 jar → dex→JVM 转换 → 标记 native 阻断。
+
+    同一个 jar 的转换结果由 spiderjvm 按 jar 地址做磁盘缓存，所以这里顺序执行即可
+    （不会重复转换），同时也避免多个 JVM 同时抢 NAS 的 CPU。
+    """
+    ok = blocked = fail = 0
+    for k in keys:
+        s = spidermod.site(k)
+        if not s or s.get("status") in ("ready", "blocked"):
+            continue
+        try:
+            r = await asyncio.to_thread(spidermod.prepare, s)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("准备爬虫源 %s 失败: %s", k, exc)
+            fail += 1
+            continue
+        if r.get("ok"):
+            ok += 1
+        elif "native" in str(r.get("error") or ""):
+            blocked += 1
+        else:
+            fail += 1
+    _log.info("爬虫源准备完成: ready=%d blocked=%d failed=%d", ok, blocked, fail)
+
+
 async def _aggregate_briefs(keyword: str, maxn: int | None = None,
                             fast_only: bool = False) -> list[dict]:
     """聚合搜索所有启用源 → 跨源合并 → 去噪/去无直链 → brief 列表（已入库）。
@@ -885,6 +1023,13 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None,
                    and s.get("api")
                    and s.get("id") not in ("dduo", "xiaoya")]
     titles = await providers.search_all(keyword, sources)
+    if not fast_only:
+        # 爬虫源要经 JVM 且单源常 3~15s，只挂在非秒回路径（详情/媒体库）；
+        # 全局搜索框（fast_only）保持原有 2~3s 响应，不因爬虫源被拖慢。
+        try:
+            titles.extend(await _spider_titles(keyword, max_sites=8))
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("爬虫源搜索失败: %s", exc)
     if maxn is None:
         maxn = int(config.get().get("max_per_keyword", 12))
     # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
@@ -3572,6 +3717,35 @@ async def _ensure_playable(picked: dict, request: Request,
 
 async def _resolve_if_needed(picked: dict, request: Request) -> dict:
     """把播放页(/share/<id>)或 302 跳转地址解析成真实媒体地址（原地更新）。"""
+    if picked:
+        _sk = _spider_parse(str(picked.get("url") or ""))
+        if _sk:
+            # 爬虫源：把 spider:// 占位换成 playerContent 的真实地址。这一步必须在
+            # 起播前完成（且只对最终选中的那条线做），否则会给播放器喂一个它
+            # 永远请求不到的 scheme。
+            _key, _flag, _vid = _sk
+            _site = spidermod.site(_key)
+            if not _site:
+                raise RuntimeError("该爬虫源已被移除")
+            _res = await asyncio.wait_for(
+                asyncio.to_thread(spidermod.play_site, _site, _flag, _vid), 25)
+            _url = str((_res or {}).get("url") or "")
+            if not _url:
+                raise RuntimeError("爬虫未返回播放地址")
+            picked["url"] = _url
+            picked["xsrc"] = False
+            picked["m3u8"] = bool(re.search(r"\.m3u8(\?|$)", _url, re.I))
+            _hdr = (_res or {}).get("header")
+            if _hdr:
+                try:
+                    _extra = json.loads(_hdr) if isinstance(_hdr, str) else dict(_hdr)
+                    _h = picked.get("headers")
+                    if not isinstance(_h, dict):
+                        _h = {}
+                        picked["headers"] = _h
+                    _h.update({str(k): str(v) for k, v in _extra.items()})
+                except Exception:  # noqa: BLE001
+                    pass
     if picked and picked.get("redirect"):
         real = await providers.resolve_redirect(
             src_client(request), picked["url"],
@@ -4981,6 +5155,54 @@ async def ext_online(q: str = "", limit: int = 200):
     return {"code": 0, "data": items[:limit]}
 
 
+@app.get("/v/api/ext/spider/status")
+async def ext_spider_status():
+    """爬虫源运行时状态：JRE / runner / dex2jar 是否就绪，副车进程与缓存数。"""
+    return {"code": 0, "data": spidermod.status()}
+
+
+@app.get("/v/api/ext/spider/sites")
+async def ext_spider_sites(q: str = "", limit: int = 400):
+    items = []
+    for s in spidermod.all_sites():
+        if q and q.lower() not in str(s.get("name") or "").lower():
+            continue
+        items.append({
+            "key": s.get("key"),
+            "name": s.get("name"),
+            "cls": s.get("class"),
+            "status": s.get("status") or "new",
+            "enabled": bool(s.get("enabled")),
+            "native_blocked": bool(s.get("native_blocked")),
+            "jar": str(s.get("jar_url") or "")[-48:],
+            "error": s.get("error") or "",
+        })
+    items.sort(key=lambda x: (x["status"] != "ready", x["name"]))
+    return {"code": 0, "data": items[:limit]}
+
+
+@app.post("/v/api/ext/spider/toggle")
+async def ext_spider_toggle(request: Request):
+    body = await request.json()
+    ok = spidermod.set_enabled(str(body.get("key") or ""), bool(body.get("enabled")))
+    return {"code": 0 if ok else 1, "msg": "" if ok else "该爬虫源不存在"}
+
+
+@app.post("/v/api/ext/spider/prepare")
+async def ext_spider_prepare(request: Request):
+    """手动触发准备（下载 jar + 转换）。导入时已自动排队，这里用于失败重试。"""
+    body = await request.json()
+    keys = body.get("keys") or []
+    if not isinstance(keys, list):
+        keys = [str(keys)]
+    keys = [str(k) for k in keys]
+    if not keys:
+        keys = [s["key"] for s in spidermod.all_sites()
+                if s.get("status") in ("new", "jar_missing", "convert_failed")]
+    asyncio.create_task(_prepare_spiders_bg(keys))
+    return {"code": 0, "data": {"queued": len(keys)}}
+
+
 @app.post("/v/api/ext/config")
 async def ext_set_config(request: Request):
     body = await request.json()
@@ -5477,10 +5699,22 @@ async def ext_import_subscription(request: Request):
             no_runtime.append({
                 "name": str(_s.get("name") or _s.get("key") or "未命名")[:24],
                 "reason": "加固源·需 Android 运行时"})
-    for _it in csp_items:
-        no_runtime.append({
-            "name": str(_it.get("name") or _it.get("key") or "未命名")[:24],
-            "reason": "爬虫源·需 Android 运行时"})
+    if csp_items:
+        # 爬虫源落库后再异步准备（下载 jar + dex→JVM 转换）。这里不同步做：
+        # 单 jar 转换 2~8s，几十个源会把导入请求拖到超时；后台跑完后源列表
+        # 会从 new 逐步变成 ready / blocked，用户能看到进度。
+        try:
+            csp_report = spidermod.upsert_sites(csp_items, jar_url_global)
+        except Exception as exc:  # noqa: BLE001
+            csp_report = {"error": str(exc)[:120]}
+        if spidermod.spiderjvm.available():
+            _names = [str(it.get("key") or "") for it in csp_items if it.get("key")]
+            asyncio.create_task(_prepare_spiders_bg(_names))
+        else:
+            for _it in csp_items:
+                no_runtime.append({
+                    "name": str(_it.get("name") or _it.get("key") or "未命名")[:24],
+                    "reason": "爬虫源·缺 JRE 运行时"})
     for _it in drpy_items:
         no_runtime.append({
             "name": str(_it.get("name") or "drpy")[:24],

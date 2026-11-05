@@ -27,7 +27,8 @@ from __future__ import annotations
 # 可选特性在公开构建中均关闭
 DDUO = False
 ADULT = False
-CATVOD = False
+# TVBox type=3 爬虫源：本构建用 JRE + dex→JVM 转换运行，不需要 Android 容器
+CATVOD = True
 DRPY = False
 GUARD = False
 
