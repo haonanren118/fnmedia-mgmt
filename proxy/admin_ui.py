@@ -1791,21 +1791,28 @@ function renderSubResult(d){
   // 汇总
   const cmsOk=cms.added||0, gOk=(g.items||[]).filter(x=>x.enabled).length;
   const csp=d.csp||{}, dr=d.drpy||{};
-  const cspOk=(csp.items||[]).filter(x=>x.enabled).length;
+  const cspItems=csp.items||[];
+  // 只有 jar 已转好、且没被 native 阻断的源才真正能搜能播；其余（待准备 /
+  // 缺 jar / 需 Android / 转换失败）单独报数，不能算进"可直接使用"。
+  const cspOk=cspItems.filter(x=>x.enabled&&x.status==="ready").length;
+  const cspN=cspItems.length, cspWait=cspN-cspOk;
   const drOk=(dr.items||[]).filter(x=>x.enabled).length;
   const totalOk=cmsOk+gOk+cspOk+drOk;
   const noRt=d.no_runtime||0, nor=d.no_runtime_detail||[], skNo=d.skipped||skips.length;
   h+='<div style="margin:8px 0;font-weight:600">共扫描 '+(d.scanned||0)+' 个站点'
     +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'：新增可直接使用 <b style="color:var(--ok,#3a9)">'+totalOk+'</b> 个'
+    +(cspN?(' · 爬虫源已登记 <b style="color:var(--accent,#4a9)">'+cspN+'</b> 个'
+      +(cspWait?('（就绪 '+cspOk+'，其余后台准备中）'):'')):'')
     +(skNo?(' · 跳过 '+skNo+' 个'):'')
-    +(noRt?(' · 需外部运行时 <b style="color:var(--warn,#d59a2b)">'+noRt+'</b> 个'):'')+'。</div>';
+    +(noRt?(' · 需 Android/Node 运行时 <b style="color:var(--warn,#d59a2b)">'+noRt+'</b> 个'):'')+'。</div>';
   // 一个可用源都没有时，直接说清是"订阅类型不匹配"，而不是让用户看着 0 猜
-  if(!totalOk && noRt){
+  if(!totalOk && !cspN && noRt){
     h+='<div style="margin:10px 0;padding:10px 12px;border:1px solid var(--warn,#d59a2b);border-radius:8px;background:rgba(213,154,43,.08)">'
      + '<div style="font-weight:600;margin-bottom:4px">该订阅中没有本构建可直接使用的源</div>'
      + '<div class="muted sm">扫描 '+esc(String(d.scanned||0))+' 个站点，其中 '+noRt
-     + ' 个依赖 Android 爬虫运行时（spider.jar / dex）或 Node 远程脚本引擎，本构建不含这些运行时，'
-     + '因此无法导入（这是能力限制，不是源失效）。</div>'
+     + ' 个依赖加固原生库（需 Android 运行时）或 Node 远程脚本引擎，这两类不在本构建能力内。'
+     + '本版已内置 JRE 爬虫运行时，<b>纯 dex 爬虫源（csp_）可以导入并播放</b>——'
+     + '若上方出现「爬虫源已登记 N 个」，就是正在后台准备的那批。</div>'
      + '<div class="muted sm" style="margin-top:4px">需要立即可播的源，请用上方「一键轻量猫源」，'
      + '或导入接口形如 <code>/api.php/provide/vod</code> 的苹果CMS订阅（type 0/1）。</div></div>';
   }
@@ -1835,7 +1842,7 @@ function renderSubResult(d){
   } else if(csp && (csp.items||[]).length){
     const jar=csp.jar||{};
     const jarBad=jar && jar.ok===false;
-    h+='<div class="subgrp"><div class="subgrp-t">🕷️ 普通爬虫源（csp_）　自动启用 '+cspOk+' / '+(csp.items||[]).length
+    h+='<div class="subgrp"><div class="subgrp-t">🕷️ 普通爬虫源（csp_）　就绪 '+cspOk+' / '+(csp.items||[]).length
       +(jarBad?' <span class="tag warn">jar 未就绪</span>':'')+'</div>';
     if(jarBad){
       h+='<div style="margin:6px 0;padding:8px 10px;border:1px solid var(--warn,#d59a2b);border-radius:8px;background:rgba(213,154,43,.08)">'
@@ -1847,9 +1854,13 @@ function renderSubResult(d){
        + '<input type="file" accept=".jar,.zip" style="display:none" onchange="uploadJar(this,\''+esc(jar.url||"")+'\')"></label></div></div>';
     }
     csp.items.forEach(it=>{
-      const state=it.enabled?'<span class="tag">已启用</span>'
-        : (it.risk?'<span class="tag warn">风险源·默认关</span>'
-           : (it.has_jar?'<span class="tag warn">默认关</span>':'<span class="tag warn">缺 jar</span>'));
+      // 状态以后端着库记录为准：ready 才真能用，其余如实标原因
+      const st=String(it.status||"new");
+      const t=({ready:["已启用",""],new:["待准备","warn"],
+                jar_missing:["缺 jar","warn"],blocked:["需 Android","warn"],
+                convert_failed:["转换失败","warn"]})[st]||[st,"warn"];
+      const state=(it.enabled&&st==="ready")?'<span class="tag">'+esc(t[0])+'</span>'
+        :'<span class="tag warn">'+esc(t[0])+(it.error?("："+esc(String(it.error).slice(0,28))):"")+'</span>';
       const cb='<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">'
         +'<input type="checkbox" '+(it.enabled?"checked":"")
         +' onchange="spToggle(this,\''+esc(it.key)+'\')" style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>';

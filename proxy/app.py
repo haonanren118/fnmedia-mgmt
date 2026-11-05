@@ -5707,6 +5707,13 @@ async def ext_import_subscription(request: Request):
             csp_report = spidermod.upsert_sites(csp_items, jar_url_global)
         except Exception as exc:  # noqa: BLE001
             csp_report = {"error": str(exc)[:120]}
+        # 回传落库后的实际记录（含 status / jar_url），前端才能如实显示
+        # 「已登记 N 个 · 待准备 / 就绪 / 缺 jar」。只给计数会让这批源在统计里消失。
+        if isinstance(csp_report, dict) and not csp_report.get("error"):
+            _keys = [str(it.get("key") or "") for it in csp_items if it.get("key")]
+            csp_report["items"] = [r for r in (spidermod.site(k) for k in _keys) if r]
+            csp_report["with_jar"] = sum(1 for r in csp_report["items"]
+                                         if r.get("jar_url"))
         if spidermod.spiderjvm.available():
             _names = [str(it.get("key") or "") for it in csp_items if it.get("key")]
             asyncio.create_task(_prepare_spiders_bg(_names))
